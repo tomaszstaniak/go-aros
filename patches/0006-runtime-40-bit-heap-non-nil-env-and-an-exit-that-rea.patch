@@ -1,4 +1,4 @@
-From 5b79f7518d84e56cc1327b33bd8cbc066b722c1c Mon Sep 17 00:00:00 2001
+From 6e21a6e0d045cb369e11b8624799952cf9961e50 Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 14:55:55 +0200
 Subject: [PATCH 6/9] runtime: 40-bit heap, non-nil env, and an exit that reaps
@@ -29,9 +29,6 @@ write1 buys: the runtime names its own next problem.
 
 The runtime now starts, allocates, runs the scheduler and spawns the GC
 goroutines. It still hits a fatal error late in bringup, not yet pinned.
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
 ---
  src/runtime/cgo/gcc_rt_aros.c | 64 +++++++++++++++++++++++++++++++----
  src/runtime/malloc.go         | 12 +++++--

@@ -1,4 +1,4 @@
-From 0dc40452c44cb82d8fbacacd33590765f265370a Mon Sep 17 00:00:00 2001
+From 2b6993568f5d4794cad50e70a00820eeed4249c8 Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 13:28:02 +0200
 Subject: [PATCH 4/9] cmd/link, runtime/cgo: link a Go program into an AROS
@@ -28,9 +28,6 @@ Four things stood between the relocation size mismatch and that:
 Known leftover: the linker still emits runtime.tlsg into a .tbss
 section. Nothing references it and LoadSeg did not object, but it
 should not be there.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
 ---
  src/cmd/link/internal/ld/data.go   |  6 +-
  src/cmd/link/internal/ld/lib.go    |  3 +

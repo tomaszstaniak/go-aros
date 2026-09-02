@@ -1,4 +1,4 @@
-From f2aa8f61af709e3a44e0bb2971d406b2a7b7c0c2 Mon Sep 17 00:00:00 2001
+From aa540ea21273a96e42686cd745c9eb7839e4af6c Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 15:06:12 +0200
 Subject: [PATCH 7/9] runtime/cgo: no-op setenv/unsetenv -- and a Go program
@@ -25,9 +25,6 @@ and the exit path retired the parked Ms without hanging.
 (The temporary tracebackothers suppression used to read the earlier
 bringup crashes is reverted; it was a console-reading crutch, not part
 of the port.)
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
 ---
  src/runtime/cgo/gcc_rt_aros.c | 7 +++++++
  src/runtime/cgo/setenv.go     | 2 +-

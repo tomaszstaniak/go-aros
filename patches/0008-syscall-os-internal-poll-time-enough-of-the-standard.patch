@@ -1,4 +1,4 @@
-From b2502960da058bb8dbffcb9f1e3576a8d576ae0b Mon Sep 17 00:00:00 2001
+From b70167d430ff35c295e4a744aa01334adf9905e8 Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 17:08:35 +0200
 Subject: [PATCH 8/9] syscall, os, internal/poll, time: enough of the standard
@@ -26,9 +26,6 @@ leading '/' means the parent directory and is relative.
 Build tags: env_unix.go, removeall_noat.go, statat_other.go and
 root_noopenat.go gain aros; rawconn.go and types_unix.go exclude it, as
 they exclude plan9.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
 ---
  ...aros-and-its-thread-pointer-lowering.patch | 178 ++++
  ...S-aros-onto-the-Plan-9-shaped-build.patch} |   3 +-

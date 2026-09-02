@@ -1,24 +1,28 @@
 # go-aros
 
-**Porting the Go gc toolchain to AROS x86_64. Early: the toolchain knows the
-platform, the runtime does not exist yet, and no Go program runs on AROS.**
+**A Go program runs on AROS x86_64.** Prints, schedules a goroutine, sends over
+a channel, allocates on the GC heap, and exits cleanly. This is a bringup tree,
+not a finished port — much of the standard library is untested and the OS layer
+is minimal — but the core runtime is up.
 
-That status line is the honest summary; the rest of this file is what has been
-established, and what has not.
+```
+hello from Go on AROS
+goroutine and heap check: 42
+```
+
+(a `println` and a `<-ch` from a goroutine, on a live AROS One under QEMU)
 
 ## Where it stands
 
 | | |
 |---|---|
 | Thread pointer on AROS | **done** — see [aros-tls](https://github.com/tomaszstaniak/aros-tls) |
-| `GOOS=aros` accepted by the toolchain | **done** |
-| `MOVQ TLS, r` lowering | **done, verified by disassembly** |
-| `package runtime` compiles | **yes**, with the OS layer stubbed |
-| A whole program compiles | **yes** — `runtime/cgo` too, via `x86_64-aros-gcc` |
-| Linking to an AROS executable | **yes** — `x86_64-aros-gcc` produces an `ET_REL` |
-| AROS's `LoadSeg` accepts it | **yes, measured** — relocations applied, 12 hunks |
-| A working OS layer | no — every OS function is a `throw` stub |
-| Anything running on AROS | **no** |
+| `GOOS=aros` and `MOVQ TLS, r` lowering | **done, verified by disassembly** |
+| `package runtime` compiles | **yes** |
+| Linking to an AROS `ET_REL`, `LoadSeg` accepts it | **yes, measured** |
+| Runtime starts: sched, channels, GC alloc, clean exit | **yes, measured** |
+| Standard library beyond the basics | **untested** |
+| `fmt`, `os` file I/O, `net`, goroutine preemption | **not yet** |
 
 ## Why bother, and why the gc toolchain
 
@@ -182,8 +186,17 @@ throws, so the first `throw` has no way to say anything.
 
 ## What remains
 
-The real OS layer, and it is the bulk of the work. Measured against Plan 9's port as
-the closest template:
+The runtime is up but thin. Known gaps, roughly in order:
+
+* **Signals and preemption.** `preemptMSupported` is false, so a tight loop
+  with no function calls will not yield. Signals are stubbed.
+* **The rest of the OS layer.** File descriptors beyond raw write to 1/2,
+  directory reads, process control — `syscall` and `os` are barely started.
+* **`goenvs`** passes an empty environment; the C startup's argv/envp is not
+  wired in.
+* **Netpoll** is the Plan-9-style stub: blocking I/O only, no poller.
+
+Sized against Plan 9's port as the closest template:
 
 | package | lines |
 |---|---|

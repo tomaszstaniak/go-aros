@@ -1,4 +1,4 @@
-From 2b6993568f5d4794cad50e70a00820eeed4249c8 Mon Sep 17 00:00:00 2001
+From 0b69d09dcbd404725500e30d7f4aea45533ccc0d Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 13:28:02 +0200
 Subject: [PATCH 4/9] cmd/link, runtime/cgo: link a Go program into an AROS

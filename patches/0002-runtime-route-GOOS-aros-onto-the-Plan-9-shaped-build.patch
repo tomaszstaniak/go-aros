@@ -1,7 +1,7 @@
 From 4c24cf8fad13aa8332798c01462bcc5f6f587944 Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 11:16:48 +0200
-Subject: [PATCH 2/3] runtime: route GOOS=aros onto the Plan 9-shaped build
+Subject: [PATCH 2/4] runtime: route GOOS=aros onto the Plan 9-shaped build
  tags
 
 Registers aros/amd64 as a platform and regenerates internal/goos, then

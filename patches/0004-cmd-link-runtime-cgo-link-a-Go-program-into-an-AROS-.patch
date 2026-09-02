@@ -1,0 +1,266 @@
+From 0dc40452c44cb82d8fbacacd33590765f265370a Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 13:28:02 +0200
+Subject: [PATCH 4/4] cmd/link, runtime/cgo: link a Go program into an AROS
+ executable
+
+External linking works. Go's linker writes go.o and x86_64-aros-gcc
+produces an ET_REL that AROS's own LoadSeg accepts and relocates --
+verified on a running AROS One with segdump, whose first-movabs check
+resolved to "dos.library". Twelve hunks, 231 mov %gs:0x18,%r14 loads in
+the final text, and no ELF TLS relocations.
+
+Four things stood between the relocation size mismatch and that:
+
+- extreloc had to agree with relocsym that R_TLS_LE is internal on
+  AROS. The counting pass excluded it and the emitting pass did not, so
+  elfrelocsect wrote 239 relocations more than it had room for.
+- -rdynamic is rejected by the AROS gcc driver, and is meaningless for
+  an ET_REL nobody dlopens; skipped in hostlink.
+- runtime/cgo needed an AROS thread file. pthread_unix.c cannot be
+  reused because AROS has no sigfillset or pthread_sigmask -- signals
+  there are Exec's per-task bits, not Unix masks. gcc_aros_amd64.c is
+  that file with the mask dance removed; pthread_getattr_np, which
+  AROS does provide, keeps the stack-bound path.
+- rt0 is two jumps and settls is a bare RET, as on Plan 9: the kernel
+  publishes the thread pointer, so the runtime has nothing to install.
+
+Known leftover: the linker still emits runtime.tlsg into a .tbss
+section. Nothing references it and LoadSeg did not object, but it
+should not be there.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
+---
+ src/cmd/link/internal/ld/data.go   |  6 +-
+ src/cmd/link/internal/ld/lib.go    |  3 +
+ src/runtime/cgo/cgo.go             |  1 +
+ src/runtime/cgo/gcc_aros_amd64.c   | 90 ++++++++++++++++++++++++++++++
+ src/runtime/cgo/gcc_fatalf.c       |  2 +-
+ src/runtime/cgo/gcc_libinit_unix.c |  2 +-
+ src/runtime/cgo/gcc_unix.c         |  2 +-
+ src/runtime/rt0_aros_amd64.s       | 13 +++++
+ src/runtime/sys_aros_amd64.s       | 12 ++++
+ 9 files changed, 127 insertions(+), 4 deletions(-)
+ create mode 100644 src/runtime/cgo/gcc_aros_amd64.c
+ create mode 100644 src/runtime/rt0_aros_amd64.s
+ create mode 100644 src/runtime/sys_aros_amd64.s
+
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index 290cf1b8..7a79bdde 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -667,7 +667,11 @@ func extreloc(ctxt *Link, ldr *loader.Loader, s loader.Sym, r loader.Reloc) (loa
+ 		return thearch.Extreloc(target, ldr, r, s)
+ 
+ 	case objabi.R_TLS_LE, objabi.R_TLS_IE:
+-		if target.IsElf() {
++		// Not on AROS: g is reached through a pointer the kernel publishes in
++		// the %gs block, so R_TLS_LE resolves internally to a zero offset and
++		// must never be handed to the host linker. This has to agree with the
++		// counting pass in relocsym, or elfrelocsect's size check trips.
++		if target.IsElf() && !target.IsAros() {
+ 			rs := r.Sym()
+ 			rr.Xsym = rs
+ 			if rr.Xsym == 0 {
+diff --git a/src/cmd/link/internal/ld/lib.go b/src/cmd/link/internal/ld/lib.go
+index 9cbc1291..574f9b9b 100644
+--- a/src/cmd/link/internal/ld/lib.go
++++ b/src/cmd/link/internal/ld/lib.go
+@@ -1819,6 +1819,9 @@ func (ctxt *Link) hostlink() {
+ 
+ 	// Force global symbols to be exported for dlopen, etc.
+ 	switch {
++	case ctxt.IsAros():
++		// Nothing to export: AROS executables are ET_REL loaded by LoadSeg,
++		// there is no dlopen of them, and the gcc driver rejects -rdynamic.
+ 	case ctxt.IsELF:
+ 		if ctxt.DynlinkingGo() || ctxt.BuildMode == BuildModeCShared || !linkerFlagSupported(ctxt.Arch, argv[0], altLinker, "-Wl,--export-dynamic-symbol=main") {
+ 			argv = append(argv, "-rdynamic")
+diff --git a/src/runtime/cgo/cgo.go b/src/runtime/cgo/cgo.go
+index 1b87fcc8..6e27ed74 100644
+--- a/src/runtime/cgo/cgo.go
++++ b/src/runtime/cgo/cgo.go
+@@ -19,6 +19,7 @@ package cgo
+ #cgo netbsd LDFLAGS: -lpthread
+ #cgo openbsd LDFLAGS: -lpthread
+ #cgo aix LDFLAGS: -Wl,-berok
++#cgo aros LDFLAGS: -Wl,--start-group -lpthread -lgcc -Wl,--end-group
+ 
+ // Use -fno-stack-protector to avoid problems locating the
+ // proper support functions. See issues #52919, #54313, #58385.
+diff --git a/src/runtime/cgo/gcc_aros_amd64.c b/src/runtime/cgo/gcc_aros_amd64.c
+new file mode 100644
+index 00000000..9eb151a4
+--- /dev/null
++++ b/src/runtime/cgo/gcc_aros_amd64.c
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// AROS has POSIX threads (libpthread, one Exec task per thread) but no POSIX
++// signal masks: sigfillset and pthread_sigmask do not exist, because signals on
++// AROS are Exec's own per-task bits rather than Unix ones. So this is
++// pthread_unix.c with the mask dance removed. The stack-bound helper keeps the
++// pthread_getattr_np path, which AROS's pthread.h does provide.
++
++#include <pthread.h>
++#include <string.h>
++#include <errno.h>
++#include <time.h>
++#include "libcgo.h"
++#include "libcgo_unix.h"
++
++void
++_cgo_sys_thread_start(ThreadStart *ts)
++{
++	pthread_attr_t attr;
++	pthread_t p;
++	size_t size;
++	int err;
++
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	pthread_attr_getstacksize(&attr, &size);
++
++	// Leave stacklo=0 and set stackhi=size; mstart will do the rest.
++	ts->g->stackhi = size;
++	err = _cgo_try_pthread_create(&p, &attr, threadentry, ts);
++	if (err != 0) {
++		fatalf("pthread_create failed: %s", strerror(err));
++	}
++}
++
++void
++x_cgo_sys_thread_create(void* (*func)(void*)) {
++	pthread_attr_t attr;
++	pthread_t p;
++	int err;
++
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	err = _cgo_try_pthread_create(&p, &attr, func, NULL);
++	if (err != 0) {
++		fatalf("pthread_create failed: %s", strerror(err));
++	}
++}
++
++void
++x_cgo_getstackbound(uintptr bounds[2])
++{
++	pthread_attr_t attr;
++	void *addr;
++	size_t size;
++
++	pthread_attr_init(&attr);
++	pthread_getattr_np(pthread_self(), &attr);
++	pthread_attr_getstack(&attr, &addr, &size); // low address
++	pthread_attr_destroy(&attr);
++
++	_cgo_tsan_acquire();
++	bounds[0] = (uintptr)addr;
++	bounds[1] = (uintptr)addr + size;
++	_cgo_tsan_release();
++}
++
++// _cgo_try_pthread_create retries pthread_create if it fails with EAGAIN.
++int
++_cgo_try_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*pfn)(void*), void* arg) {
++	int tries;
++	int err;
++	struct timespec ts;
++
++	for (tries = 0; tries < 20; tries++) {
++		err = pthread_create(thread, attr, pfn, arg);
++		if (err == 0) {
++			return 0;
++		}
++		if (err != EAGAIN) {
++			return err;
++		}
++		ts.tv_sec = 0;
++		ts.tv_nsec = (tries + 1) * 1000 * 1000; // Milliseconds.
++		nanosleep(&ts, nil);
++	}
++	return EAGAIN;
++}
+diff --git a/src/runtime/cgo/gcc_fatalf.c b/src/runtime/cgo/gcc_fatalf.c
+index 2754414f..ed5b0d73 100644
+--- a/src/runtime/cgo/gcc_fatalf.c
++++ b/src/runtime/cgo/gcc_fatalf.c
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix
++//go:build unix || aros
+ 
+ #include <stdarg.h>
+ #ifdef __ANDROID__
+diff --git a/src/runtime/cgo/gcc_libinit_unix.c b/src/runtime/cgo/gcc_libinit_unix.c
+index 8024fa8d..dfb0a939 100644
+--- a/src/runtime/cgo/gcc_libinit_unix.c
++++ b/src/runtime/cgo/gcc_libinit_unix.c
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix
++//go:build unix || aros
+ 
+ // When cross-compiling with clang to linux/armv5, atomics are emulated
+ // and cause a compiler warning. This results in a build failure since
+diff --git a/src/runtime/cgo/gcc_unix.c b/src/runtime/cgo/gcc_unix.c
+index f6066753..99d4e49a 100644
+--- a/src/runtime/cgo/gcc_unix.c
++++ b/src/runtime/cgo/gcc_unix.c
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix
++//go:build unix || aros
+ 
+ #include "libcgo.h"
+ #include "libcgo_unix.h"
+diff --git a/src/runtime/rt0_aros_amd64.s b/src/runtime/rt0_aros_amd64.s
+new file mode 100644
+index 00000000..6f6c66c0
+--- /dev/null
++++ b/src/runtime/rt0_aros_amd64.s
+@@ -0,0 +1,13 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "textflag.h"
++
++// With external linking the AROS C startup calls main (asm_amd64.s), so these
++// only have to exist for the linker's entry-symbol bookkeeping.
++TEXT _rt0_amd64_aros(SB),NOSPLIT,$-8
++	JMP	_rt0_amd64(SB)
++
++TEXT _rt0_amd64_aros_lib(SB),NOSPLIT,$0
++	JMP	_rt0_amd64_lib(SB)
+diff --git a/src/runtime/sys_aros_amd64.s b/src/runtime/sys_aros_amd64.s
+new file mode 100644
+index 00000000..70468892
+--- /dev/null
++++ b/src/runtime/sys_aros_amd64.s
+@@ -0,0 +1,12 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "textflag.h"
++
++// On AROS the thread pointer is not something the runtime installs: the kernel
++// publishes the address of the running task's private word at %gs:0x18, and
++// get_tls reads it from there. So there is nothing for settls to set -- g is
++// stored straight into that word by the g(r) form. Same shape as Plan 9.
++TEXT runtime·settls(SB),NOSPLIT,$0
++	RET
+-- 
+2.54.0 (Apple Git-157)
+

@@ -15,7 +15,8 @@ established, and what has not.
 | `MOVQ TLS, r` lowering | **done, verified by disassembly** |
 | `package runtime` compiles | **yes**, with the OS layer stubbed |
 | A whole program compiles | **yes** — `runtime/cgo` too, via `x86_64-aros-gcc` |
-| Linking to an AROS executable | not yet — fails inside ELF relocation emission |
+| Linking to an AROS executable | **yes** — `x86_64-aros-gcc` produces an `ET_REL` |
+| AROS's `LoadSeg` accepts it | **yes, measured** — relocations applied, 12 hunks |
 | A working OS layer | no — every OS function is a `throw` stub |
 | Anything running on AROS | **no** |
 
@@ -118,16 +119,66 @@ than boilerplate:
 * **The note functions came straight back out** of the stub file: `lock_sema.go`
   already supplies them once `aros` is on its build tag.
 
-Where it stops today:
+## Patch 4: the external link works
+
+The size mismatch was the two relocation passes disagreeing: `relocsym`
+(counting) had the AROS exception for `R_TLS_LE`, `extreloc` (emitting) did
+not, so `elfrelocsect` wrote 239 relocations it had not budgeted for — exactly
+5736 bytes at 24 per relocation. Once both passes agree, Go's linker writes
+`go.o` and hands it to `x86_64-aros-gcc`.
+
+Three more things stood between that and an output file:
+
+* `-rdynamic` — rejected by the AROS gcc driver, and meaningless for an
+  `ET_REL` that nobody `dlopen`s. Skipped in `hostlink`.
+* `runtime/cgo` needed an AROS thread file. `pthread_unix.c` cannot be reused:
+  AROS has **no `sigfillset` and no `pthread_sigmask`**, because signals there
+  are Exec's per-task bits rather than Unix masks. `gcc_aros_amd64.c` is that
+  file with the mask dance removed; `pthread_getattr_np`, which AROS does
+  provide, keeps the stack-bound path.
+* `rt0_aros_amd64.s` is two jumps and `runtime·settls` is a bare `RET`, as on
+  Plan 9: the kernel publishes the thread pointer, so the runtime has nothing
+  to install.
+
+The result, for `package main; func main() {}`:
 
 ```
-panic: elfrelocsect: size mismatch 2253840 != 2120664 + 127440
+$ CGO_ENABLED=1 GOOS=aros GOARCH=amd64 CC=x86_64-aros-gcc \
+      go build -ldflags="-linkmode=external -extld=x86_64-aros-gcc" -o hello .
+$ x86_64-aros-readelf -h hello | grep Type
+  Type:                              REL (Relocatable file)
 ```
 
-So the external-linking question is **not yet answered** — but the failure has
-moved from "unsupported platform" to a specific arithmetic mismatch inside
-relocation emission, which is a bug to find rather than a wall. Nothing so far
-suggests the approach is unworkable.
+3.4 MB, header identical to a known-good AROS binary, **231** `mov %gs:0x18,%r14`
+loads in the final text — the thread pointer landing in Go's `g` register — and
+no ELF TLS relocations. (A grep for "TLS" finds 23, but they are plain
+`R_X86_64_64` to symbols that merely have "tls" in their *names*: `tls_sem`,
+`tlskeys`, `runtime.settls`.)
+
+And the measurement that matters, on a running AROS One, using the sandbox's
+`segdump` — which `LoadSeg`s a file without executing it and reads back the
+first `movabs` immediate the startup code will pass to `OpenLibrary`:
+
+```
+first movabs rdi at +0x3e imm=00000004bcb00f0 -> "dos.library"
+hunk  1: hdr=000000004bca4be4 size=46936  ...
+hunk  2: hdr=000000004bd3a7e4 size=461563 ...
+...
+hunk 11: hdr=000000004ccf4e84 size=52     ...
+```
+
+`"dos.library"` means the `.text` relocations were applied; a stripped or
+mis-linked AROS binary shows `(null)` there and dies in `strlen` before
+`main`. Twelve hunks loaded. So the assumption this port was built on is now a
+fact: **AROS's own loader accepts what Go plus the AROS toolchain produce.**
+
+Known leftover: the linker still emits `runtime.tlsg` into a `.tbss` section.
+Nothing references it and `LoadSeg` did not object, but it should not be
+there.
+
+The binary does not *run* — every OS-layer function is still a stub — and
+running it is not informative yet, since `write1` is a no-op and `exit`
+throws, so the first `throw` has no way to say anything.
 
 ## What remains
 

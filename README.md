@@ -188,6 +188,18 @@ throws, so the first `throw` has no way to say anything.
 
 The runtime is up but thin. Known gaps, roughly in order:
 
+* **The TLS lowering must stop hard-coding the offset.** AROS developer
+  review of [aros-tls](https://github.com/tomaszstaniak/aros-tls) made the
+  point that one x86_64 binary must run on native *and* hosted kernels, so
+  `ArosTLSOffset = 24` cannot stay a compile-time constant. Switch to the
+  Windows/Android model already in the toolchain: a `runtime.tls_g` global
+  filled at startup from a kernel query, `MOVQ tls_g, r; MOVQ (r)(GS*1), r`.
+  Small change; the code path exists.
+* **A real program: `fmt.Println` and `os.Args`.** `fmt` pulls `os`, which
+  pulls `syscall`, which for AROS is barely started. Start the way the
+  runtime was started: build a program that imports `fmt`, collect the
+  undefined-symbol list, and size it before writing anything.
+
 * **Signals and preemption.** `preemptMSupported` is false, so a tight loop
   with no function calls will not yield. Signals are stubbed.
 * **The rest of the OS layer.** File descriptors beyond raw write to 1/2,

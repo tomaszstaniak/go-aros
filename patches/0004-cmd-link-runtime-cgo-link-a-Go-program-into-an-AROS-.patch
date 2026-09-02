@@ -1,7 +1,7 @@
 From 0dc40452c44cb82d8fbacacd33590765f265370a Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 13:28:02 +0200
-Subject: [PATCH 4/4] cmd/link, runtime/cgo: link a Go program into an AROS
+Subject: [PATCH 4/9] cmd/link, runtime/cgo: link a Go program into an AROS
  executable
 
 External linking works. Go's linker writes go.o and x86_64-aros-gcc

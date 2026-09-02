@@ -1,0 +1,86 @@
+From 4dbf2a2965594ada8a44a1e25eed1d1c187abace Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 17:18:38 +0200
+Subject: [PATCH 9/9] runtime/cgo: threads asleep in usleep or yield must
+ notice exit too
+
+sysmon never parks while any P is busy; it loops on usleep. Waking the
+parked Ms at exit was therefore not enough: a program that never
+blocked hung at exit, waited on forever by libpthread's join-everything
+hook, while one that blocked on a channel exited cleanly. Check the
+exiting flag after nanosleep and sched_yield as well, and retire the
+thread there.
+
+With that, fmt.Println and os.Args work end to end and the process
+returns to the shell:
+
+    hello from Go on AROS, via fmt
+    args: [C:fmthello alpha beta gamma]
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
+---
+ src/runtime/cgo/gcc_rt_aros.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/cgo/gcc_rt_aros.c b/src/runtime/cgo/gcc_rt_aros.c
+index 4d56ed1b..e10807af 100644
+--- a/src/runtime/cgo/gcc_rt_aros.c
++++ b/src/runtime/cgo/gcc_rt_aros.c
+@@ -23,6 +23,10 @@
+ #include <errno.h>
+ #include "libcgo.h"
+ 
++// Set by x_cgo_aros_exit; every thread that wakes or returns from a sleep
++// afterwards retires itself. See the exit path below.
++static volatile int exiting;
++
+ // -- raw output and exit --------------------------------------------------
+ 
+ struct aros_write_args { uintptr fd; void *buf; int32_t n; int32_t ret; };
+@@ -58,7 +62,6 @@ struct aros_sema {
+ 
+ static pthread_mutex_t all_semas_mu = PTHREAD_MUTEX_INITIALIZER;
+ static aros_sema      *all_semas;
+-static volatile int    exiting;
+ 
+ struct aros_exit_args { int32_t code; };
+ 
+@@ -157,6 +160,19 @@ x_cgo_aros_nanotime(struct aros_nanotime_args *a)
+ 
+ struct aros_usleep_args { uint32_t us; };
+ 
++// sysmon never parks while any P is busy; it loops on usleep. So the exit
++// path's "wake the parked Ms" is not enough on its own -- a thread that is
++// sleeping rather than parked has to notice too, or the libpthread exit hook
++// waits for it forever. Measured: a program that never blocks hung at exit
++// exactly this way, while one that blocked on a channel exited cleanly.
++static void
++leave_if_exiting_unlocked(void)
++{
++	if (exiting) {
++		pthread_exit(NULL);
++	}
++}
++
+ void
+ x_cgo_aros_usleep(struct aros_usleep_args *a)
+ {
+@@ -164,12 +180,14 @@ x_cgo_aros_usleep(struct aros_usleep_args *a)
+ 	ts.tv_sec = a->us / 1000000;
+ 	ts.tv_nsec = (long)(a->us % 1000000) * 1000;
+ 	nanosleep(&ts, NULL);
++	leave_if_exiting_unlocked();
+ }
+ 
+ void
+ x_cgo_aros_yield(void *unused)
+ {
+ 	sched_yield();
++	leave_if_exiting_unlocked();
+ }
+ 
+ // -- memory -----------------------------------------------------------------
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,16 +1,15 @@
 # go-aros
 
-**A Go program runs on AROS x86_64.** Prints, schedules a goroutine, sends over
-a channel, allocates on the GC heap, and exits cleanly. This is a bringup tree,
-not a finished port — much of the standard library is untested and the OS layer
-is minimal — but the core runtime is up.
+**Go programs run on AROS x86_64, `fmt` and `os` included.** This is a bringup
+tree, not a finished port — most of `os` beyond files and the console is
+`ENOSYS`, there is no preemption and no poller — but the runtime, the
+scheduler, channels, GC allocation, `fmt.Println`, `os.Args` and a clean exit
+back to the shell all work, measured on a live system under QEMU.
 
 ```
-hello from Go on AROS
-goroutine and heap check: 42
+hello from Go on AROS, via fmt
+args: [C:fmthello alpha beta gamma]
 ```
-
-(a `println` and a `<-ch` from a goroutine, on a live AROS One under QEMU)
 
 ## Where it stands
 
@@ -21,8 +20,9 @@ goroutine and heap check: 42
 | `package runtime` compiles | **yes** |
 | Linking to an AROS `ET_REL`, `LoadSeg` accepts it | **yes, measured** |
 | Runtime starts: sched, channels, GC alloc, clean exit | **yes, measured** |
-| Standard library beyond the basics | **untested** |
-| `fmt`, `os` file I/O, `net`, goroutine preemption | **not yet** |
+| `fmt.Println`, `os.Args`, `os.Stdout`, file open/read/write/seek | **yes, measured** |
+| `os.Stat`, readdir, process spawning, links, chmod | **no — ENOSYS** |
+| `net`, goroutine preemption, signals, timezones | **not yet** |
 
 ## Why bother, and why the gc toolchain
 
@@ -195,10 +195,9 @@ The runtime is up but thin. Known gaps, roughly in order:
   Windows/Android model already in the toolchain: a `runtime.tls_g` global
   filled at startup from a kernel query, `MOVQ tls_g, r; MOVQ (r)(GS*1), r`.
   Small change; the code path exists.
-* **A real program: `fmt.Println` and `os.Args`.** `fmt` pulls `os`, which
-  pulls `syscall`, which for AROS is barely started. Start the way the
-  runtime was started: build a program that imports `fmt`, collect the
-  undefined-symbol list, and size it before writing anything.
+* **The rest of `os`.** `Stat`/`Lstat`, `readdir`, `Mkdir`, `Remove`,
+  `rename`, process spawning (`SystemTagList`, as the Rust port does) —
+  all `ENOSYS` today. Each is a C-library call away.
 
 * **Signals and preemption.** `preemptMSupported` is false, so a tight loop
   with no function calls will not yield. Signals are stubbed.

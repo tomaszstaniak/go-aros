@@ -1,7 +1,7 @@
 From 962070d7be0cb943244d073b87d36822c32f3aa2 Mon Sep 17 00:00:00 2001
 From: tomaszstaniak <nbw.designs@gmail.com>
 Date: Wed, 2 Sep 2026 13:13:52 +0200
-Subject: [PATCH 3/4] runtime, cmd: stub the AROS OS layer and reach the
+Subject: [PATCH 3/9] runtime, cmd: stub the AROS OS layer and reach the
  external linker
 
 Stubs with correct signatures for the 37 OS-layer symbols, deliberately

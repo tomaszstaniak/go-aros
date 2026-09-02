@@ -1,0 +1,69 @@
+From f2aa8f61af709e3a44e0bb2971d406b2a7b7c0c2 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 15:06:12 +0200
+Subject: [PATCH 7/9] runtime/cgo: no-op setenv/unsetenv -- and a Go program
+ runs on AROS
+
+The last missing bringup symbol: runtime.main requires _cgo_setenv and
+_cgo_unsetenv non-nil so os.Setenv can track the C environment. Their
+usual source, gcc_setenv.c, is unix-tagged and calls setenv/unsetenv,
+which AROS's C library does not have. So provide no-ops in gcc_rt_aros.c
+-- there is no C environment to keep in step, and os.Getenv reads Go's
+own copy regardless.
+
+With that, a Go program runs on AROS x86_64:
+
+    hello from Go on AROS
+    goroutine and heap check: 42
+
+printed via the runtime's write1, then a clean exit back to the shell.
+The second line is a goroutine scheduled onto another M, a value sent
+over a channel and received, and the channel allocated from the AllocMem
+heap -- so the scheduler, channels and GC-managed allocation all work,
+and the exit path retired the parked Ms without hanging.
+
+(The temporary tracebackothers suppression used to read the earlier
+bringup crashes is reverted; it was a console-reading crutch, not part
+of the port.)
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
+---
+ src/runtime/cgo/gcc_rt_aros.c | 7 +++++++
+ src/runtime/cgo/setenv.go     | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/runtime/cgo/gcc_rt_aros.c b/src/runtime/cgo/gcc_rt_aros.c
+index 308f662b..9fb2a227 100644
+--- a/src/runtime/cgo/gcc_rt_aros.c
++++ b/src/runtime/cgo/gcc_rt_aros.c
+@@ -79,6 +79,13 @@ x_cgo_aros_exit(struct aros_exit_args *a)
+ 	exit(a->code);
+ }
+ 
++// AROS's C library has no setenv/unsetenv. The Go runtime only requires the
++// pointers to be non-nil (a cgo-enabled binary must be able to keep the C
++// environment in step with os.Setenv); with no C environment to keep in step,
++// these are no-ops for now. os.Getenv still works -- it reads Go's own copy.
++void x_cgo_setenv(char **arg)   { (void)arg; }
++void x_cgo_unsetenv(char **arg) { (void)arg; }
++
+ // -- time -------------------------------------------------------------------
+ 
+ struct aros_walltime_args { int64_t sec; int32_t nsec; };
+diff --git a/src/runtime/cgo/setenv.go b/src/runtime/cgo/setenv.go
+index 2247cb2b..3ebe4901 100644
+--- a/src/runtime/cgo/setenv.go
++++ b/src/runtime/cgo/setenv.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix
++//go:build unix || aros
+ 
+ package cgo
+ 
+-- 
+2.54.0 (Apple Git-157)
+

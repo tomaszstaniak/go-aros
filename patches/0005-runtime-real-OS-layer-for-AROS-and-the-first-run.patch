@@ -1,0 +1,606 @@
+From 95c6779ab6d718d044e0d8c5d091f7b71be50e1b Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 14:23:17 +0200
+Subject: [PATCH 5/9] runtime: real OS layer for AROS, and the first run
+
+The stubs become calls into C: write, exit, clock_gettime (both
+clocks), nanosleep, sched_yield, AllocMem, and a per-M semaphore over a
+pthread mutex and condition variable. Each crosses via asmcgocall to an
+entry point in runtime/cgo/gcc_rt_aros.c, handed to package runtime
+through a linknamed pointer exactly as _cgo_thread_start is. AROS has
+no syscalls, so this makes runtime/cgo a hard dependency of the port;
+an AROS executable is externally linked anyway.
+
+The heap is one 256 MB arena from AllocMem taken in osinit, because
+mem_sbrk.go needs sbrk results contiguous with the current break and
+AllocMem cannot promise that call by call. initBloc is not used: it
+starts the break at the end of the loaded module, meaningless for a
+hunk-loaded ET_REL.
+
+mOS.sema is a uintptr on purpose: semacreate is reached from lock2 and
+notesleep, where a pointer write into m needs a write barrier those
+callers forbid.
+
+First run on the patched kernel reached runtime.abort from rt0_go's
+TLS sanity check, because _cgo_init was nil: its initialiser lives in
+callbacks_unix.go, which the unix build tag excludes on AROS. Tagged,
+like the C files before it. AROS's crash requester symbolised the Go
+function by name, which is what made this a ten-minute diagnosis.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
+---
+ src/runtime/cgo/aros.go           |  73 ++++++++++++
+ src/runtime/cgo/callbacks_unix.go |   2 +-
+ src/runtime/cgo/gcc_rt_aros.c     | 164 ++++++++++++++++++++++++++
+ src/runtime/os_aros.go            | 183 +++++++++++++++++++++++-------
+ src/runtime/time_aros.go          |  42 +++++--
+ 5 files changed, 413 insertions(+), 51 deletions(-)
+ create mode 100644 src/runtime/cgo/aros.go
+ create mode 100644 src/runtime/cgo/gcc_rt_aros.c
+
+diff --git a/src/runtime/cgo/aros.go b/src/runtime/cgo/aros.go
+new file mode 100644
+index 00000000..9f834aaa
+--- /dev/null
++++ b/src/runtime/cgo/aros.go
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++package cgo
++
++import _ "unsafe" // for go:linkname
++
++// The AROS OS layer lives in gcc_rt_aros.c. These hand its entry points to
++// package runtime the same way _cgo_thread_start is handed over: the cgo
++// import directive stays here, and runtime sees only a linknamed pointer.
++
++//go:cgo_import_static x_cgo_aros_write
++//go:linkname x_cgo_aros_write x_cgo_aros_write
++//go:linkname _cgo_aros_write _cgo_aros_write
++var x_cgo_aros_write byte
++var _cgo_aros_write = &x_cgo_aros_write
++
++//go:cgo_import_static x_cgo_aros_exit
++//go:linkname x_cgo_aros_exit x_cgo_aros_exit
++//go:linkname _cgo_aros_exit _cgo_aros_exit
++var x_cgo_aros_exit byte
++var _cgo_aros_exit = &x_cgo_aros_exit
++
++//go:cgo_import_static x_cgo_aros_walltime
++//go:linkname x_cgo_aros_walltime x_cgo_aros_walltime
++//go:linkname _cgo_aros_walltime _cgo_aros_walltime
++var x_cgo_aros_walltime byte
++var _cgo_aros_walltime = &x_cgo_aros_walltime
++
++//go:cgo_import_static x_cgo_aros_nanotime
++//go:linkname x_cgo_aros_nanotime x_cgo_aros_nanotime
++//go:linkname _cgo_aros_nanotime _cgo_aros_nanotime
++var x_cgo_aros_nanotime byte
++var _cgo_aros_nanotime = &x_cgo_aros_nanotime
++
++//go:cgo_import_static x_cgo_aros_usleep
++//go:linkname x_cgo_aros_usleep x_cgo_aros_usleep
++//go:linkname _cgo_aros_usleep _cgo_aros_usleep
++var x_cgo_aros_usleep byte
++var _cgo_aros_usleep = &x_cgo_aros_usleep
++
++//go:cgo_import_static x_cgo_aros_yield
++//go:linkname x_cgo_aros_yield x_cgo_aros_yield
++//go:linkname _cgo_aros_yield _cgo_aros_yield
++var x_cgo_aros_yield byte
++var _cgo_aros_yield = &x_cgo_aros_yield
++
++//go:cgo_import_static x_cgo_aros_allocmem
++//go:linkname x_cgo_aros_allocmem x_cgo_aros_allocmem
++//go:linkname _cgo_aros_allocmem _cgo_aros_allocmem
++var x_cgo_aros_allocmem byte
++var _cgo_aros_allocmem = &x_cgo_aros_allocmem
++
++//go:cgo_import_static x_cgo_aros_semacreate
++//go:linkname x_cgo_aros_semacreate x_cgo_aros_semacreate
++//go:linkname _cgo_aros_semacreate _cgo_aros_semacreate
++var x_cgo_aros_semacreate byte
++var _cgo_aros_semacreate = &x_cgo_aros_semacreate
++
++//go:cgo_import_static x_cgo_aros_semasleep
++//go:linkname x_cgo_aros_semasleep x_cgo_aros_semasleep
++//go:linkname _cgo_aros_semasleep _cgo_aros_semasleep
++var x_cgo_aros_semasleep byte
++var _cgo_aros_semasleep = &x_cgo_aros_semasleep
++
++//go:cgo_import_static x_cgo_aros_semawakeup
++//go:linkname x_cgo_aros_semawakeup x_cgo_aros_semawakeup
++//go:linkname _cgo_aros_semawakeup _cgo_aros_semawakeup
++var x_cgo_aros_semawakeup byte
++var _cgo_aros_semawakeup = &x_cgo_aros_semawakeup
+diff --git a/src/runtime/cgo/callbacks_unix.go b/src/runtime/cgo/callbacks_unix.go
+index 311f549e..af2e50f9 100644
+--- a/src/runtime/cgo/callbacks_unix.go
++++ b/src/runtime/cgo/callbacks_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix
++//go:build unix || aros
+ 
+ package cgo
+ 
+diff --git a/src/runtime/cgo/gcc_rt_aros.c b/src/runtime/cgo/gcc_rt_aros.c
+new file mode 100644
+index 00000000..c4152507
+--- /dev/null
++++ b/src/runtime/cgo/gcc_rt_aros.c
+@@ -0,0 +1,164 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++// The AROS runtime's operating-system layer, C side.
++//
++// AROS has no syscalls: everything is a library call through SysBase or the
++// C library, and both need a C stack and C calling convention. So the Go
++// runtime reaches these through asmcgocall, exactly the way it reaches
++// _cgo_thread_start, and each function takes one pointer to an argument block.
++// This makes runtime/cgo a hard dependency of the AROS runtime, which is
++// acceptable because an AROS executable is always externally linked anyway.
++
++#include <proto/exec.h>
++#include <exec/memory.h>
++#include <pthread.h>
++#include <sched.h>
++#include <time.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <errno.h>
++#include "libcgo.h"
++
++// -- raw output and exit --------------------------------------------------
++
++struct aros_write_args { uintptr fd; void *buf; int32_t n; int32_t ret; };
++
++void
++x_cgo_aros_write(struct aros_write_args *a)
++{
++	int r = write((int)a->fd, a->buf, (size_t)a->n);
++	a->ret = r < 0 ? -errno : r;
++}
++
++struct aros_exit_args { int32_t code; };
++
++void
++x_cgo_aros_exit(struct aros_exit_args *a)
++{
++	exit(a->code);
++}
++
++// -- time -------------------------------------------------------------------
++
++struct aros_walltime_args { int64_t sec; int32_t nsec; };
++
++void
++x_cgo_aros_walltime(struct aros_walltime_args *a)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_REALTIME, &ts);
++	a->sec = ts.tv_sec;
++	a->nsec = (int32_t)ts.tv_nsec;
++}
++
++struct aros_nanotime_args { int64_t ns; };
++
++void
++x_cgo_aros_nanotime(struct aros_nanotime_args *a)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	a->ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++struct aros_usleep_args { uint32_t us; };
++
++void
++x_cgo_aros_usleep(struct aros_usleep_args *a)
++{
++	struct timespec ts;
++	ts.tv_sec = a->us / 1000000;
++	ts.tv_nsec = (long)(a->us % 1000000) * 1000;
++	nanosleep(&ts, NULL);
++}
++
++void
++x_cgo_aros_yield(void *unused)
++{
++	sched_yield();
++}
++
++// -- memory -----------------------------------------------------------------
++
++// The Go heap on AROS is one arena from AllocMem, handed out by sbrk in
++// runtime/os_aros.go. mem_sbrk.go requires sbrk results to be contiguous
++// with the current break, which AllocMem cannot promise call by call, so the
++// whole reservation is taken up front. MEMF_CLEAR because sbrk memory is
++// assumed zeroed.
++struct aros_allocmem_args { uintptr size; void *ret; };
++
++void
++x_cgo_aros_allocmem(struct aros_allocmem_args *a)
++{
++	a->ret = AllocMem(a->size, MEMF_ANY | MEMF_CLEAR);
++}
++
++// -- per-M semaphore, for lock_sema.go ---------------------------------------
++
++typedef struct {
++	pthread_mutex_t mu;
++	pthread_cond_t  cv;
++	int             count;
++} aros_sema;
++
++struct aros_sema_args { void *sema; int64_t ns; int32_t ret; };
++
++void
++x_cgo_aros_semacreate(struct aros_sema_args *a)
++{
++	aros_sema *s = malloc(sizeof *s);
++	if (s == NULL) {
++		fatalf("aros: out of memory creating semaphore");
++	}
++	pthread_mutex_init(&s->mu, NULL);
++	pthread_cond_init(&s->cv, NULL);
++	s->count = 0;
++	a->sema = s;
++}
++
++void
++x_cgo_aros_semasleep(struct aros_sema_args *a)
++{
++	aros_sema *s = a->sema;
++	pthread_mutex_lock(&s->mu);
++	if (a->ns < 0) {
++		while (s->count == 0) {
++			pthread_cond_wait(&s->cv, &s->mu);
++		}
++	} else {
++		struct timespec dl;
++		clock_gettime(CLOCK_REALTIME, &dl);
++		dl.tv_sec  += a->ns / 1000000000LL;
++		dl.tv_nsec += a->ns % 1000000000LL;
++		if (dl.tv_nsec >= 1000000000L) {
++			dl.tv_sec++;
++			dl.tv_nsec -= 1000000000L;
++		}
++		while (s->count == 0) {
++			if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) == ETIMEDOUT) {
++				break;
++			}
++		}
++	}
++	if (s->count > 0) {
++		s->count--;
++		a->ret = 0;
++	} else {
++		a->ret = -1;
++	}
++	pthread_mutex_unlock(&s->mu);
++}
++
++void
++x_cgo_aros_semawakeup(struct aros_sema_args *a)
++{
++	aros_sema *s = a->sema;
++	pthread_mutex_lock(&s->mu);
++	s->count++;
++	pthread_cond_signal(&s->cv);
++	pthread_mutex_unlock(&s->mu);
++}
+diff --git a/src/runtime/os_aros.go b/src/runtime/os_aros.go
+index c0109b86..3a94b348 100644
+--- a/src/runtime/os_aros.go
++++ b/src/runtime/os_aros.go
+@@ -4,17 +4,17 @@
+ 
+ //go:build aros
+ 
+-// AROS OS layer.
++// AROS OS layer, Go side.
+ //
+-// Every function here is a stub with the correct signature and a throw. That
+-// is deliberate and temporary: the point of this file, in this state, is to
+-// let package runtime compile so a program can be *linked*, which is the only
+-// way to find out whether -linkmode=external can hand an ET_REL executable to
+-// x86_64-aros-gcc. Until that question is answered there is no sense writing
+-// the real implementations, because a negative answer changes the shape of the
+-// port. Each stub is then replaced by exec.library/dos.library calls.
++// AROS has no syscalls. Everything is a library call through SysBase or the C
++// library, so every operation here crosses into C via asmcgocall to an entry
++// point in runtime/cgo/gcc_rt_aros.c, handed over through a linknamed pointer
++// the same way _cgo_thread_start is. That makes runtime/cgo a hard dependency
++// of this port; an AROS executable is always externally linked, so it costs
++// nothing that was not already being paid.
+ //
+-// Nothing here runs. Do not read a throw as a design decision.
++// Threads are Exec tasks created by libpthread; the runtime never creates one
++// itself, because with cgo present newm goes through _cgo_thread_start.
+ 
+ package runtime
+ 
+@@ -23,73 +23,176 @@ import (
+ 	"unsafe"
+ )
+ 
+-const arosStub = "aros: not implemented"
++//go:linkname _cgo_aros_write _cgo_aros_write
++//go:linkname _cgo_aros_exit _cgo_aros_exit
++//go:linkname _cgo_aros_yield _cgo_aros_yield
++//go:linkname _cgo_aros_allocmem _cgo_aros_allocmem
++//go:linkname _cgo_aros_semacreate _cgo_aros_semacreate
++//go:linkname _cgo_aros_semasleep _cgo_aros_semasleep
++//go:linkname _cgo_aros_semawakeup _cgo_aros_semawakeup
++var (
++	_cgo_aros_write      unsafe.Pointer
++	_cgo_aros_exit       unsafe.Pointer
++	_cgo_aros_yield      unsafe.Pointer
++	_cgo_aros_allocmem   unsafe.Pointer
++	_cgo_aros_semacreate unsafe.Pointer
++	_cgo_aros_semasleep  unsafe.Pointer
++	_cgo_aros_semawakeup unsafe.Pointer
++)
+ 
+-// mOS is the per-M operating-system state. An M on AROS will be an Exec task;
+-// waitsemacount is what lock_sema.go requires of every platform that parks on
+-// a counting semaphore rather than a futex.
++// mOS is the per-M operating-system state: an opaque semaphore owned by the
++// C side (a pthread mutex, condition variable and count), plus the counter
++// lock_sema.go requires of every semaphore-based platform. sema is a uintptr,
++// not an unsafe.Pointer, on purpose: semacreate is reached from lock2 and
++// notesleep, where a pointer write into m would need a write barrier that
++// those callers forbid. The C side owns the memory; the GC never sees it.
+ type mOS struct {
+ 	waitsemacount uint32
++	sema          uintptr
+ }
+ 
+ type sigset struct{}
+ 
+ type gsignalStack struct{}
+ 
+-// AROS has no Unix signal numbering. The value only has to bound the tables in
+-// sigqueue_aros.go.
++// AROS has no Unix signal numbering. The value only bounds sigqueue_aros.go.
+ const _NSIG = 32
+ 
++// The Go heap on AROS is one arena from AllocMem, taken in osinit and handed
++// out by sbrk. mem_sbrk.go needs each sbrk result to be contiguous with the
++// current break, which AllocMem cannot promise call by call. 256 MB is a
++// first-cut figure: enough for small programs, not a design decision.
++const arosArenaSize = 256 << 20
++
+ //
+-// Startup and environment
++// Startup
+ //
+ 
+-func osinit()                 { throw(arosStub) }
+-func goenvs()                 { throw(arosStub) }
++func osinit() {
++	numCPUStartup = 1 // the kernel patch this runs on was measured on a UP build
++	physPageSize = 4096
++
++	var a struct {
++		size uintptr
++		ret  unsafe.Pointer
++	}
++	a.size = arosArenaSize
++	asmcgocall(_cgo_aros_allocmem, unsafe.Pointer(&a))
++	if a.ret == nil {
++		throw("aros: AllocMem for the heap arena failed")
++	}
++	// initBloc() is not used: it starts the break at the end of the
++	// loaded module, which is meaningless for a hunk-loaded ET_REL.
++	bloc = uintptr(a.ret)
++	blocMax = bloc + arosArenaSize
++}
++
++// goenvs leaves the environment empty for now. The C startup does pass
++// argv, but nothing guarantees envp follows it, so goenvs_unix would read
++// whatever happens to be there.
++func goenvs() {}
++
+ func libpreinit()             {}
+ func getCPUCount() int32      { return 1 }
+ func readRandom(r []byte) int { return 0 }
+ 
+ //
+-// Threads. An M will map onto an Exec task created with CreateNewProc.
++// Threads
+ //
+ 
+-func newosproc(mp *m)                                { throw(arosStub) }
+-func newosproc0(stacksize uintptr, fn unsafe.Pointer) { throw(arosStub) }
+-func mpreinit(mp *m)                                 { throw(arosStub) }
+-func minit()                                         { throw(arosStub) }
+-func unminit()                                       { throw(arosStub) }
+-func mdestroy(mp *m)                                 {}
+-func exitThread(wait *atomic.Uint32)                 { throw(arosStub) }
+-func osyield()                                       { throw(arosStub) }
++// Unreachable with cgo present: newm takes the _cgo_thread_start path, which
++// gcc_aros_amd64.c implements over pthread_create.
++func newosproc(mp *m) { throw("aros: newosproc called without cgo") }
++
++func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
++	throw("aros: newosproc0 called without cgo")
++}
++
++func mpreinit(mp *m) {
++	mp.gsignal = malg(32 * 1024)
++	mp.gsignal.m = mp
++}
++
++func minit()         {}
++func unminit()       {}
++func mdestroy(mp *m) {}
++
++// With cgo, an exiting M returns to its C thread instead (mexit's osStack
++// path), so this is not reached in practice.
++func exitThread(wait *atomic.Uint32) { throw("aros: exitThread") }
++
++func osyield() {
++	asmcgocall(_cgo_aros_yield, nil)
++}
+ 
+ //go:nosplit
+ func osyield_no_g() { osyield() }
+ 
+ //
+-// Semaphores, used by lock_sema.go and the note implementation.
++// Semaphores, for lock_sema.go
+ //
+ 
+-func semacreate(mp *m)         { throw(arosStub) }
+-func semasleep(ns int64) int   { throw(arosStub); return 0 }
+-func semawakeup(mp *m)         { throw(arosStub) }
++type arosSemaArgs struct {
++	sema uintptr
++	ns   int64
++	ret  int32
++}
++
++func semacreate(mp *m) {
++	if mp.sema != 0 {
++		return
++	}
++	var a arosSemaArgs
++	asmcgocall(_cgo_aros_semacreate, unsafe.Pointer(&a))
++	mp.sema = a.sema
++}
++
++//go:nosplit
++func semasleep(ns int64) int {
++	a := arosSemaArgs{sema: getg().m.sema, ns: ns}
++	asmcgocall(_cgo_aros_semasleep, unsafe.Pointer(&a))
++	return int(a.ret)
++}
++
++//go:nosplit
++func semawakeup(mp *m) {
++	a := arosSemaArgs{sema: mp.sema}
++	asmcgocall(_cgo_aros_semawakeup, unsafe.Pointer(&a))
++}
+ 
+ //
+-// Process exit and raw output. These go to dos.library, not to a file
+-// descriptor: AROS has no fd table at this level.
++// Exit and raw output
+ //
+ 
+-func exit(e int32) { throw(arosStub) }
++func exit(e int32) {
++	a := struct{ code int32 }{e}
++	asmcgocall(_cgo_aros_exit, unsafe.Pointer(&a))
++}
+ 
+ //go:nosplit
+-func write1(fd uintptr, buf unsafe.Pointer, n int32) int32 { return -1 }
++func write1(fd uintptr, buf unsafe.Pointer, n int32) int32 {
++	a := struct {
++		fd  uintptr
++		buf unsafe.Pointer
++		n   int32
++		ret int32
++	}{fd, buf, n, 0}
++	asmcgocall(_cgo_aros_write, unsafe.Pointer(&a))
++	return a.ret
++}
+ 
+-func crash() { throw(arosStub) }
++func crash() { exit(2) }
+ 
+ //
+-// Memory. mem_sbrk.go drives this; on AROS the primitive is AllocMem, which
+-// has no brk-style contiguous growth, so this is the piece most likely to need
+-// a different shape from Plan 9's.
++// Memory, for mem_sbrk.go
+ //
+ 
+-func sbrk(n uintptr) unsafe.Pointer { return nil }
++func sbrk(n uintptr) unsafe.Pointer {
++	bl := bloc
++	n = memRound(n)
++	if bl+n > blocMax {
++		return nil
++	}
++	bloc += n
++	return unsafe.Pointer(bl)
++}
+diff --git a/src/runtime/time_aros.go b/src/runtime/time_aros.go
+index fff34ade..652e02ab 100644
+--- a/src/runtime/time_aros.go
++++ b/src/runtime/time_aros.go
+@@ -4,19 +4,34 @@
+ 
+ //go:build aros
+ 
+-// Time for AROS. Stubs -- see the header of os_aros.go for why.
+-//
+-// The real source will be timer.device, or ReadEClock via the E-clock, whose
+-// frequency AROS exposes as SysBase->ex_EClockFrequency. Note that a monotonic
+-// clock has to come from the same place: there is nothing like CLOCK_MONOTONIC.
+-
+ package runtime
+ 
+-import _ "unsafe" // for go:linkname
++import "unsafe"
++
++//go:linkname _cgo_aros_walltime _cgo_aros_walltime
++//go:linkname _cgo_aros_nanotime _cgo_aros_nanotime
++//go:linkname _cgo_aros_usleep _cgo_aros_usleep
++var (
++	_cgo_aros_walltime unsafe.Pointer
++	_cgo_aros_nanotime unsafe.Pointer
++	_cgo_aros_usleep   unsafe.Pointer
++)
+ 
+-func nanotime1() int64 { return 0 }
++// Both clocks come from the C library's clock_gettime; CLOCK_MONOTONIC exists
++// on AROS and was measured to advance correctly across nanosleep.
+ 
+-func usleep(µs uint32) {}
++//go:nosplit
++func nanotime1() int64 {
++	var a struct{ ns int64 }
++	asmcgocall(_cgo_aros_nanotime, unsafe.Pointer(&a))
++	return a.ns
++}
++
++//go:nosplit
++func usleep(µs uint32) {
++	a := struct{ us uint32 }{µs}
++	asmcgocall(_cgo_aros_usleep, unsafe.Pointer(&a))
++}
+ 
+ //go:nosplit
+ func usleep_no_g(µs uint32) { usleep(µs) }
+@@ -25,4 +40,11 @@ func usleep_no_g(µs uint32) { usleep(µs) }
+ // See comment in timestub.go.
+ //
+ //go:linkname time_now time.now
+-func time_now() (sec int64, nsec int32, mono int64) { return 0, 0, 0 }
++func time_now() (sec int64, nsec int32, mono int64) {
++	var a struct {
++		sec  int64
++		nsec int32
++	}
++	asmcgocall(_cgo_aros_walltime, unsafe.Pointer(&a))
++	return a.sec, a.nsec, nanotime()
++}
+-- 
+2.54.0 (Apple Git-157)
+

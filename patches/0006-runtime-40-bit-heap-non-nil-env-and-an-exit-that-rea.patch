@@ -1,0 +1,211 @@
+From 5b79f7518d84e56cc1327b33bd8cbc066b722c1c Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 14:55:55 +0200
+Subject: [PATCH 6/9] runtime: 40-bit heap, non-nil env, and an exit that reaps
+ parked Ms
+
+Three fixes found by running the binary on the patched kernel, each the
+next fatal error the one before it revealed -- which is what a working
+write1 buys: the runtime names its own next problem.
+
+- Page allocator. At 48 heapAddrBits the page summaries reserve ~585 MB,
+  fine when reservation is lazy mmap but not when the heap is one
+  AllocMem arena, where a reservation costs real memory. AROS joins
+  ios/arm64 at 40 bits (~2.3 MB of summaries) and drops the amd64
+  sign-extension arenaBaseOffset with it. "failed to reserve page
+  summary memory" -> past mallocinit.
+
+- goenvs left envs nil; gogetenv reads nil as "before env init" and
+  throws. Make it an empty non-nil slice. "getenv before env init" ->
+  past schedinit.
+
+- exit. libpthread's ADD2EXIT hook pthread_joins every thread before the
+  process may end (so code isn't unloaded under a running thread). A Go M
+  parked in semasleep never returns, so a plain exit() hangs -- this is
+  in the AROS source, not guessed. So exit now flags the process exiting
+  and broadcasts every per-M semaphore; each parked M, waking in
+  x_cgo_aros_semasleep, leaves through pthread_exit instead of returning
+  to Go, and the hook then finds nothing to wait for.
+
+The runtime now starts, allocates, runs the scheduler and spawns the GC
+goroutines. It still hits a fatal error late in bringup, not yet pinned.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GZ168WWqSb1VQE2yxUKBTe
+---
+ src/runtime/cgo/gcc_rt_aros.c | 64 +++++++++++++++++++++++++++++++----
+ src/runtime/malloc.go         | 12 +++++--
+ src/runtime/os_aros.go        |  7 ++--
+ 3 files changed, 72 insertions(+), 11 deletions(-)
+
+diff --git a/src/runtime/cgo/gcc_rt_aros.c b/src/runtime/cgo/gcc_rt_aros.c
+index c4152507..308f662b 100644
+--- a/src/runtime/cgo/gcc_rt_aros.c
++++ b/src/runtime/cgo/gcc_rt_aros.c
+@@ -34,11 +34,48 @@ x_cgo_aros_write(struct aros_write_args *a)
+ 	a->ret = r < 0 ? -errno : r;
+ }
+ 
++// Process exit on AROS has a rule the Go runtime has to respect: libpthread
++// registers an exit hook (__pthread_Exit_Func, via ADD2EXIT) that waits for
++// every thread ever created -- spinning on detached ones, joining the rest --
++// before the process is allowed to end. Its reason is sound (the code the
++// threads run is about to be unloaded), but a Go M parked in semasleep never
++// returns on its own, so a plain exit() would wait forever. Measured: it does.
++//
++// So exit here first marks the process as exiting and wakes every parked M;
++// each one, on waking inside x_cgo_aros_semasleep, leaves through
++// pthread_exit instead of returning to Go. Only then is exit() called, and the
++// hook finds nothing left to wait for. Ms that are running Go code at that
++// moment keep running until they next park, which for a fatal error is
++// immediate (the world is stopped) and for a normal exit is soon.
++
++typedef struct aros_sema aros_sema;
++struct aros_sema {
++	pthread_mutex_t mu;
++	pthread_cond_t  cv;
++	int             count;
++	aros_sema      *next;
++};
++
++static pthread_mutex_t all_semas_mu = PTHREAD_MUTEX_INITIALIZER;
++static aros_sema      *all_semas;
++static volatile int    exiting;
++
+ struct aros_exit_args { int32_t code; };
+ 
+ void
+ x_cgo_aros_exit(struct aros_exit_args *a)
+ {
++	aros_sema *s;
++
++	pthread_mutex_lock(&all_semas_mu);
++	exiting = 1;
++	for (s = all_semas; s != NULL; s = s->next) {
++		pthread_mutex_lock(&s->mu);
++		pthread_cond_broadcast(&s->cv);
++		pthread_mutex_unlock(&s->mu);
++	}
++	pthread_mutex_unlock(&all_semas_mu);
++
+ 	exit(a->code);
+ }
+ 
+@@ -99,12 +136,6 @@ x_cgo_aros_allocmem(struct aros_allocmem_args *a)
+ 
+ // -- per-M semaphore, for lock_sema.go ---------------------------------------
+ 
+-typedef struct {
+-	pthread_mutex_t mu;
+-	pthread_cond_t  cv;
+-	int             count;
+-} aros_sema;
+-
+ struct aros_sema_args { void *sema; int64_t ns; int32_t ret; };
+ 
+ void
+@@ -117,17 +148,36 @@ x_cgo_aros_semacreate(struct aros_sema_args *a)
+ 	pthread_mutex_init(&s->mu, NULL);
+ 	pthread_cond_init(&s->cv, NULL);
+ 	s->count = 0;
++
++	pthread_mutex_lock(&all_semas_mu);
++	s->next = all_semas;
++	all_semas = s;
++	pthread_mutex_unlock(&all_semas_mu);
++
+ 	a->sema = s;
+ }
+ 
++// A parked M that wakes to find the process exiting must not go back into
++// Go: the exit hook is waiting for this very thread to end. See x_cgo_aros_exit.
++static void
++leave_if_exiting(aros_sema *s)
++{
++	if (exiting) {
++		pthread_mutex_unlock(&s->mu);
++		pthread_exit(NULL);
++	}
++}
++
+ void
+ x_cgo_aros_semasleep(struct aros_sema_args *a)
+ {
+ 	aros_sema *s = a->sema;
+ 	pthread_mutex_lock(&s->mu);
++	leave_if_exiting(s);
+ 	if (a->ns < 0) {
+ 		while (s->count == 0) {
+ 			pthread_cond_wait(&s->cv, &s->mu);
++			leave_if_exiting(s);
+ 		}
+ 	} else {
+ 		struct timespec dl;
+@@ -142,7 +192,9 @@ x_cgo_aros_semasleep(struct aros_sema_args *a)
+ 			if (pthread_cond_timedwait(&s->cv, &s->mu, &dl) == ETIMEDOUT) {
+ 				break;
+ 			}
++			leave_if_exiting(s);
+ 		}
++		leave_if_exiting(s);
+ 	}
+ 	if (s->count > 0) {
+ 		s->count--;
+diff --git a/src/runtime/malloc.go b/src/runtime/malloc.go
+index 8c5ec383..4518395b 100644
+--- a/src/runtime/malloc.go
++++ b/src/runtime/malloc.go
+@@ -210,7 +210,13 @@ const (
+ 	// to a 48-bit address space like every other arm64 platform.
+ 	//
+ 	// WebAssembly currently has a limit of 4GB linear memory.
+-	heapAddrBits = (_64bit*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64))*48 + (1-_64bit+goarch.IsWasm)*(32-(goarch.IsMips+goarch.IsMipsle)) + 40*goos.IsIos*goarch.IsArm64
++	// AROS is the other case of a 64-bit architecture with a small address
++	// space that cannot reserve lazily: its heap is one AllocMem arena handed
++	// out sbrk-style, so a reservation costs real memory. At 48 bits the page
++	// summaries alone come to ~585 MB; at 40 they are ~2.3 MB. No AROS machine
++	// has a terabyte, so 40 bits loses nothing. The amd64 sign-extension
++	// arenaBaseOffset is dropped with it, as on every other 40-bit platform.
++	heapAddrBits = (_64bit*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)*(1-goos.IsAros))*48 + (1-_64bit+goarch.IsWasm)*(32-(goarch.IsMips+goarch.IsMipsle)) + 40*goos.IsIos*goarch.IsArm64 + 40*goos.IsAros
+ 
+ 	// maxAlloc is the maximum size of an allocation. On 64-bit,
+ 	// it's theoretically possible to allocate 1<<heapAddrBits bytes. On
+@@ -256,7 +262,7 @@ const (
+ 	// logHeapArenaBytes is log_2 of heapArenaBytes. For clarity,
+ 	// prefer using heapArenaBytes where possible (we need the
+ 	// constant to compute some other constants).
+-	logHeapArenaBytes = (6+20)*(_64bit*(1-goos.IsWindows)*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)) + (2+20)*(_64bit*goos.IsWindows) + (2+20)*(1-_64bit) + (9+10)*goarch.IsWasm + (2+20)*goos.IsIos*goarch.IsArm64
++	logHeapArenaBytes = (6+20)*(_64bit*(1-goos.IsWindows)*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)*(1-goos.IsAros)) + (2+20)*(_64bit*goos.IsWindows) + (2+20)*(1-_64bit) + (9+10)*goarch.IsWasm + (2+20)*goos.IsIos*goarch.IsArm64 + (2+20)*goos.IsAros
+ 
+ 	// heapArenaBitmapWords is the size of each heap arena's bitmap in uintptrs.
+ 	heapArenaBitmapWords = heapArenaWords / (8 * goarch.PtrSize)
+@@ -311,7 +317,7 @@ const (
+ 	//
+ 	// On other platforms, the user address space is contiguous
+ 	// and starts at 0, so no offset is necessary.
+-	arenaBaseOffset = 0xffff800000000000*goarch.IsAmd64 + 0x0a00000000000000*goos.IsAix
++	arenaBaseOffset = 0xffff800000000000*goarch.IsAmd64*(1-goos.IsAros) + 0x0a00000000000000*goos.IsAix
+ 	// A typed version of this constant that will make it into DWARF (for viewcore).
+ 	arenaBaseOffsetUintptr = uintptr(arenaBaseOffset)
+ 
+diff --git a/src/runtime/os_aros.go b/src/runtime/os_aros.go
+index 3a94b348..548bc0a2 100644
+--- a/src/runtime/os_aros.go
++++ b/src/runtime/os_aros.go
+@@ -89,8 +89,11 @@ func osinit() {
+ 
+ // goenvs leaves the environment empty for now. The C startup does pass
+ // argv, but nothing guarantees envp follows it, so goenvs_unix would read
+-// whatever happens to be there.
+-func goenvs() {}
++// whatever happens to be there. The slice must still be non-nil: gogetenv
++// treats nil as "called before goenvs" and throws.
++func goenvs() {
++	envs = make([]string, 0)
++}
+ 
+ func libpreinit()             {}
+ func getCPUCount() int32      { return 1 }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,178 @@
+From 86663a8236404b85f98789cb4cd7cb63da4a812e Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 11:02:14 +0200
+Subject: [PATCH] x86_64: add GOOS=aros and its thread-pointer lowering
+
+AROS has no ELF TLS and no syscalls, but the aros-tls kernel patch
+publishes the address of the running task's private word in the per-core
+block behind %gs, whose GDT descriptor is dpl=3 and so readable from
+userspace. That gives MOVQ TLS, r a one-load, call-free lowering.
+
+Since %gs:24 holds a pointer to the g slot rather than the slot itself,
+this is the two-instruction form, as on Plan 9 and Windows, and the
+linker's Tlsoffset is 0 because g sits at offset 0 of the block. The
+resulting g access assembles byte-identically to Plan 9's; only the base
+load differs, and needs no relocation.
+
+Toolchain only -- there is no runtime for this GOOS yet.
+---
+ src/cmd/internal/obj/x86/asm6.go   | 18 ++++++++++++++++++
+ src/cmd/internal/obj/x86/obj6.go   | 11 +++++++++--
+ src/cmd/internal/objabi/head.go    |  5 +++++
+ src/cmd/link/internal/ld/data.go   |  2 +-
+ src/cmd/link/internal/ld/sym.go    |  2 +-
+ src/cmd/link/internal/ld/target.go |  5 +++++
+ src/internal/syslist/syslist.go    |  1 +
+ 7 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/src/cmd/internal/obj/x86/asm6.go b/src/cmd/internal/obj/x86/asm6.go
+index 89b64f4e..6d9c330e 100644
+--- a/src/cmd/internal/obj/x86/asm6.go
++++ b/src/cmd/internal/obj/x86/asm6.go
+@@ -5182,6 +5182,24 @@ func (ab *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
+ 						ab.Put1(0x8B)
+ 						ab.asmand(ctxt, cursym, p, &pp.From, &p.To)
+ 
++					case objabi.Haros:
++						// TLS base is ArosTLSOffset(GS): the kernel keeps a
++						// per-core block behind %gs whose GDT descriptor is
++						// dpl=3, and the dispatcher stores the address of the
++						// running task's private word there.
++						pp.From = p.From
++
++						pp.From.Type = obj.TYPE_MEM
++						pp.From.Name = obj.NAME_NONE
++						pp.From.Reg = REG_NONE
++						pp.From.Offset = ArosTLSOffset
++						pp.From.Index = REG_NONE
++						pp.From.Scale = 0
++						ab.rexflag |= Pw
++						ab.Put2(0x65, // GS
++							0x8B)
++						ab.asmand(ctxt, cursym, p, &pp.From, &p.To)
++
+ 					case objabi.Hsolaris: // TODO(rsc): Delete Hsolaris from list. Should not use this code. See progedit in obj6.c.
+ 						// TLS base is 0(FS).
+ 						pp.From = p.From
+diff --git a/src/cmd/internal/obj/x86/obj6.go b/src/cmd/internal/obj/x86/obj6.go
+index 8125acfa..bc7033ba 100644
+--- a/src/cmd/internal/obj/x86/obj6.go
++++ b/src/cmd/internal/obj/x86/obj6.go
+@@ -42,6 +42,13 @@ import (
+ 	"strings"
+ )
+ 
++// ArosTLSOffset is where the AROS kernel publishes the address of the running
++// task's private TLS word inside the per-core block behind %gs. See the
++// aros-tls patch series: tls_t is { SysBase, KernelBase, ThisTask, ThisTaskTLS },
++// and the field sits before the SMP-only member so this offset holds for both
++// UP and SMP kernels.
++const ArosTLSOffset = 24
++
+ func CanUse1InsnTLS(ctxt *obj.Link) bool {
+ 	if isAndroid {
+ 		// Android uses a global variable for the tls offset.
+@@ -60,7 +67,7 @@ func CanUse1InsnTLS(ctxt *obj.Link) bool {
+ 	}
+ 
+ 	switch ctxt.Headtype {
+-	case objabi.Hplan9, objabi.Hwindows:
++	case objabi.Hplan9, objabi.Hwindows, objabi.Haros:
+ 		return false
+ 	case objabi.Hlinux, objabi.Hfreebsd:
+ 		return !ctxt.Flag_shared
+@@ -195,7 +202,7 @@ func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
+ 	}
+ 
+ 	// TODO: Remove.
+-	if ctxt.Headtype == objabi.Hwindows && ctxt.Arch.Family == sys.AMD64 || ctxt.Headtype == objabi.Hplan9 {
++	if ctxt.Headtype == objabi.Hwindows && ctxt.Arch.Family == sys.AMD64 || ctxt.Headtype == objabi.Hplan9 || ctxt.Headtype == objabi.Haros {
+ 		if p.From.Scale == 1 && p.From.Index == REG_TLS {
+ 			p.From.Scale = 2
+ 		}
+diff --git a/src/cmd/internal/objabi/head.go b/src/cmd/internal/objabi/head.go
+index 3109b5cb..47335435 100644
+--- a/src/cmd/internal/objabi/head.go
++++ b/src/cmd/internal/objabi/head.go
+@@ -49,12 +49,15 @@ const (
+ 	Hwasip1
+ 	Hwindows
+ 	Haix
++	Haros
+ )
+ 
+ func (h *HeadType) Set(s string) error {
+ 	switch s {
+ 	case "aix":
+ 		*h = Haix
++	case "aros":
++		*h = Haros
+ 	case "darwin", "ios":
+ 		*h = Hdarwin
+ 	case "dragonfly":
+@@ -87,6 +90,8 @@ func (h HeadType) String() string {
+ 	switch h {
+ 	case Haix:
+ 		return "aix"
++	case Haros:
++		return "aros"
+ 	case Hdarwin:
+ 		return "darwin"
+ 	case Hdragonfly:
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index 4a27db5a..a7d8e87b 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -320,7 +320,7 @@ func (st *relocSymState) relocsym(s loader.Sym, P []byte) {
+ 				// related to the fact that our own TLS storage happens
+ 				// to take up 8 bytes.
+ 				o = 8 + ldr.SymValue(rs)
+-			} else if target.IsElf() || target.IsPlan9() || target.IsDarwin() {
++			} else if target.IsElf() || target.IsPlan9() || target.IsDarwin() || target.IsAros() {
+ 				o = int64(syms.Tlsoffset) + r.Add()
+ 			} else if target.IsWindows() {
+ 				o = r.Add()
+diff --git a/src/cmd/link/internal/ld/sym.go b/src/cmd/link/internal/ld/sym.go
+index 6ae11060..de312254 100644
+--- a/src/cmd/link/internal/ld/sym.go
++++ b/src/cmd/link/internal/ld/sym.go
+@@ -75,7 +75,7 @@ func (ctxt *Link) computeTLSOffset() {
+ 	default:
+ 		log.Fatalf("unknown thread-local storage offset for %v", ctxt.HeadType)
+ 
+-	case objabi.Hplan9, objabi.Hwindows, objabi.Hjs, objabi.Hwasip1, objabi.Haix:
++	case objabi.Hplan9, objabi.Hwindows, objabi.Hjs, objabi.Hwasip1, objabi.Haix, objabi.Haros:
+ 		break
+ 
+ 	case objabi.Hlinux,
+diff --git a/src/cmd/link/internal/ld/target.go b/src/cmd/link/internal/ld/target.go
+index d0ce99f3..a7f0cd23 100644
+--- a/src/cmd/link/internal/ld/target.go
++++ b/src/cmd/link/internal/ld/target.go
+@@ -156,6 +156,11 @@ func (t *Target) IsPlan9() bool {
+ 	return t.HeadType == objabi.Hplan9
+ }
+ 
++func (t *Target) IsAros() bool {
++	t.mustSetHeadType()
++	return t.HeadType == objabi.Haros
++}
++
+ func (t *Target) IsAIX() bool {
+ 	t.mustSetHeadType()
+ 	return t.HeadType == objabi.Haix
+diff --git a/src/internal/syslist/syslist.go b/src/internal/syslist/syslist.go
+index 2349b6ea..af5d63c3 100644
+--- a/src/internal/syslist/syslist.go
++++ b/src/internal/syslist/syslist.go
+@@ -16,6 +16,7 @@ package syslist
+ // If you add an entry to this list, look at UnixOS, below.
+ var KnownOS = map[string]bool{
+ 	"aix":       true,
++	"aros":      true,
+ 	"android":   true,
+ 	"darwin":    true,
+ 	"dragonfly": true,
+-- 
+2.54.0 (Apple Git-157)
+

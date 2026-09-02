@@ -1,0 +1,783 @@
+From 962070d7be0cb943244d073b87d36822c32f3aa2 Mon Sep 17 00:00:00 2001
+From: tomaszstaniak <nbw.designs@gmail.com>
+Date: Wed, 2 Sep 2026 13:13:52 +0200
+Subject: [PATCH 3/3] runtime, cmd: stub the AROS OS layer and reach the
+ external linker
+
+Stubs with correct signatures for the 37 OS-layer symbols, deliberately
+throwing rather than working: the point is to compile and link a program
+so the -linkmode=external question can be answered before the real
+implementations are written, since a negative answer would change the
+shape of the port.
+
+lock_sema.go already supplies the note functions once aros is on its
+build tag, so those stubs came straight back out.
+
+Also: treat Haros as ELF in archinit and asmb2 so the linker writes a
+relocatable object for the host linker, but keep R_TLS_LE resolved
+internally -- g is reached through a pointer the kernel publishes in the
+%gs block, not through ELF TLS, so handing that relocation to
+x86_64-aros-gcc would ask it for something it cannot do. And drop -fPIC
+and -pthread for GOOS=aros in cmd/go, adding -mcmodel=large
+-mno-red-zone: AROS builds everything ET_REL and its gcc driver rejects
+-pthread outright.
+
+Everything now compiles, runtime/cgo included, and the linker reaches
+ELF relocation emission before failing on a size mismatch.
+---
+ ...OS-aros-onto-the-Plan-9-shaped-build.patch | 429 ++++++++++++++++++
+ src/cmd/go/internal/work/exec.go              |  15 +-
+ src/cmd/link/internal/amd64/obj.go            |   3 +-
+ src/cmd/link/internal/ld/asmb.go              |   3 +-
+ src/cmd/link/internal/ld/data.go              |   2 +-
+ src/internal/goos/zgoos_aros.go               |  27 ++
+ src/runtime/os_aros.go                        |  95 ++++
+ src/runtime/signal_aros.go                    |  33 ++
+ src/runtime/sigqueue_aros.go                  |  17 +
+ src/runtime/time_aros.go                      |  28 ++
+ 10 files changed, 645 insertions(+), 7 deletions(-)
+ create mode 100644 patches/0001-runtime-route-GOOS-aros-onto-the-Plan-9-shaped-build.patch
+ create mode 100644 src/internal/goos/zgoos_aros.go
+ create mode 100644 src/runtime/os_aros.go
+ create mode 100644 src/runtime/signal_aros.go
+ create mode 100644 src/runtime/sigqueue_aros.go
+ create mode 100644 src/runtime/time_aros.go
+
+diff --git a/patches/0001-runtime-route-GOOS-aros-onto-the-Plan-9-shaped-build.patch b/patches/0001-runtime-route-GOOS-aros-onto-the-Plan-9-shaped-build.patch
+new file mode 100644
+index 00000000..cc258dc8
+--- /dev/null
++++ b/patches/0001-runtime-route-GOOS-aros-onto-the-Plan-9-shaped-build.patch
+@@ -0,0 +1,429 @@
++From 4c24cf8fad13aa8332798c01462bcc5f6f587944 Mon Sep 17 00:00:00 2001
++From: tomaszstaniak <nbw.designs@gmail.com>
++Date: Wed, 2 Sep 2026 11:16:48 +0200
++Subject: [PATCH] runtime: route GOOS=aros onto the Plan 9-shaped build tags
++
++Registers aros/amd64 as a platform and regenerates internal/goos, then
++picks the shared implementations that fit a system with no mmap, no
++futex, no Unix signal delivery and no poller: mem_sbrk, lock_sema,
++netpoll_stub, and our own time and low-level stubs.
++
++Keeps the generated allocator tables rather than Plan 9's empty ones --
++that substitution is a space saving we do not need.
++
++Cuts the undefined OS-layer symbols from 57 to 37. Nothing runs yet.
++---
++ src/cmd/dist/build.go                | 1 +
++ src/internal/goos/zgoos_aix.go       | 1 +
++ src/internal/goos/zgoos_android.go   | 1 +
++ src/internal/goos/zgoos_darwin.go    | 1 +
++ src/internal/goos/zgoos_dragonfly.go | 1 +
++ src/internal/goos/zgoos_freebsd.go   | 1 +
++ src/internal/goos/zgoos_hurd.go      | 1 +
++ src/internal/goos/zgoos_illumos.go   | 1 +
++ src/internal/goos/zgoos_ios.go       | 1 +
++ src/internal/goos/zgoos_js.go        | 1 +
++ src/internal/goos/zgoos_linux.go     | 1 +
++ src/internal/goos/zgoos_netbsd.go    | 1 +
++ src/internal/goos/zgoos_openbsd.go   | 1 +
++ src/internal/goos/zgoos_plan9.go     | 1 +
++ src/internal/goos/zgoos_solaris.go   | 1 +
++ src/internal/goos/zgoos_wasip1.go    | 1 +
++ src/internal/goos/zgoos_windows.go   | 1 +
++ src/internal/goos/zgoos_zos.go       | 1 +
++ src/internal/platform/zosarch.go     | 2 ++
++ src/runtime/lock_sema.go             | 2 +-
++ src/runtime/mem_nonsbrk.go           | 2 +-
++ src/runtime/mem_sbrk.go              | 2 +-
++ src/runtime/mmap.go                  | 2 +-
++ src/runtime/netpoll_stub.go          | 2 +-
++ src/runtime/sigqueue.go              | 2 +-
++ src/runtime/sigqueue_note.go         | 2 +-
++ src/runtime/stubs2.go                | 2 +-
++ src/runtime/stubs3.go                | 2 +-
++ src/runtime/timestub.go              | 2 +-
++ src/runtime/timestub2.go             | 2 +-
++ 30 files changed, 31 insertions(+), 11 deletions(-)
++
++diff --git a/src/cmd/dist/build.go b/src/cmd/dist/build.go
++index 78d55bec..5361f76e 100644
++--- a/src/cmd/dist/build.go
+++++ b/src/cmd/dist/build.go
++@@ -1783,6 +1783,7 @@ func checkNotStale(env []string, goBinary string, targets ...string) {
++ // by 'go tool dist list'.
++ var cgoEnabled = map[string]bool{
++ 	"aix/ppc64":       true,
+++	"aros/amd64":      false,
++ 	"darwin/amd64":    true,
++ 	"darwin/arm64":    true,
++ 	"dragonfly/amd64": true,
++diff --git a/src/internal/goos/zgoos_aix.go b/src/internal/goos/zgoos_aix.go
++index 24e05c93..c97a9f16 100644
++--- a/src/internal/goos/zgoos_aix.go
+++++ b/src/internal/goos/zgoos_aix.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `aix`
++ 
++ const IsAix = 1
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_android.go b/src/internal/goos/zgoos_android.go
++index 3c4a3185..dad4078a 100644
++--- a/src/internal/goos/zgoos_android.go
+++++ b/src/internal/goos/zgoos_android.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `android`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 1
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_darwin.go b/src/internal/goos/zgoos_darwin.go
++index 10b14998..6703800a 100644
++--- a/src/internal/goos/zgoos_darwin.go
+++++ b/src/internal/goos/zgoos_darwin.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `darwin`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 1
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_dragonfly.go b/src/internal/goos/zgoos_dragonfly.go
++index b92d1269..75a54fd4 100644
++--- a/src/internal/goos/zgoos_dragonfly.go
+++++ b/src/internal/goos/zgoos_dragonfly.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `dragonfly`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 1
++diff --git a/src/internal/goos/zgoos_freebsd.go b/src/internal/goos/zgoos_freebsd.go
++index f547591a..309aa2a6 100644
++--- a/src/internal/goos/zgoos_freebsd.go
+++++ b/src/internal/goos/zgoos_freebsd.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `freebsd`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_hurd.go b/src/internal/goos/zgoos_hurd.go
++index 1189d65d..158f334f 100644
++--- a/src/internal/goos/zgoos_hurd.go
+++++ b/src/internal/goos/zgoos_hurd.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `hurd`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_illumos.go b/src/internal/goos/zgoos_illumos.go
++index 4f025408..47162f7a 100644
++--- a/src/internal/goos/zgoos_illumos.go
+++++ b/src/internal/goos/zgoos_illumos.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `illumos`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_ios.go b/src/internal/goos/zgoos_ios.go
++index 02f3586f..c7373b9c 100644
++--- a/src/internal/goos/zgoos_ios.go
+++++ b/src/internal/goos/zgoos_ios.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `ios`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_js.go b/src/internal/goos/zgoos_js.go
++index 48187418..2d0bbfa4 100644
++--- a/src/internal/goos/zgoos_js.go
+++++ b/src/internal/goos/zgoos_js.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `js`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_linux.go b/src/internal/goos/zgoos_linux.go
++index 6f4d4e07..d82bf2f4 100644
++--- a/src/internal/goos/zgoos_linux.go
+++++ b/src/internal/goos/zgoos_linux.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `linux`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_netbsd.go b/src/internal/goos/zgoos_netbsd.go
++index 948603df..e158e5d2 100644
++--- a/src/internal/goos/zgoos_netbsd.go
+++++ b/src/internal/goos/zgoos_netbsd.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `netbsd`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_openbsd.go b/src/internal/goos/zgoos_openbsd.go
++index f4b20145..0e8601d1 100644
++--- a/src/internal/goos/zgoos_openbsd.go
+++++ b/src/internal/goos/zgoos_openbsd.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `openbsd`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_plan9.go b/src/internal/goos/zgoos_plan9.go
++index 95572dff..524d2f41 100644
++--- a/src/internal/goos/zgoos_plan9.go
+++++ b/src/internal/goos/zgoos_plan9.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `plan9`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_solaris.go b/src/internal/goos/zgoos_solaris.go
++index c7058260..5584428b 100644
++--- a/src/internal/goos/zgoos_solaris.go
+++++ b/src/internal/goos/zgoos_solaris.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `solaris`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_wasip1.go b/src/internal/goos/zgoos_wasip1.go
++index ae35eeba..91adc9e9 100644
++--- a/src/internal/goos/zgoos_wasip1.go
+++++ b/src/internal/goos/zgoos_wasip1.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `wasip1`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_windows.go b/src/internal/goos/zgoos_windows.go
++index f89f4cf8..0373193f 100644
++--- a/src/internal/goos/zgoos_windows.go
+++++ b/src/internal/goos/zgoos_windows.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `windows`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/goos/zgoos_zos.go b/src/internal/goos/zgoos_zos.go
++index 29fb0f8b..1443ba34 100644
++--- a/src/internal/goos/zgoos_zos.go
+++++ b/src/internal/goos/zgoos_zos.go
++@@ -7,6 +7,7 @@ package goos
++ const GOOS = `zos`
++ 
++ const IsAix = 0
+++const IsAros = 0
++ const IsAndroid = 0
++ const IsDarwin = 0
++ const IsDragonfly = 0
++diff --git a/src/internal/platform/zosarch.go b/src/internal/platform/zosarch.go
++index ec6368e8..ef15bc50 100644
++--- a/src/internal/platform/zosarch.go
+++++ b/src/internal/platform/zosarch.go
++@@ -9,6 +9,7 @@ package platform
++ // including known-broken ports.
++ var List = []OSArch{
++ 	{"aix", "ppc64"},
+++	{"aros", "amd64"},
++ 	{"android", "386"},
++ 	{"android", "amd64"},
++ 	{"android", "arm"},
++@@ -61,6 +62,7 @@ var List = []OSArch{
++ 
++ var distInfo = map[OSArch]osArchInfo{
++ 	{"aix", "ppc64"}:       {CgoSupported: true},
+++	{"aros", "amd64"}:      {},
++ 	{"android", "386"}:     {CgoSupported: true},
++ 	{"android", "amd64"}:   {CgoSupported: true},
++ 	{"android", "arm"}:     {CgoSupported: true},
++diff --git a/src/runtime/lock_sema.go b/src/runtime/lock_sema.go
++index 3e1b07b9..9333f3f0 100644
++--- a/src/runtime/lock_sema.go
+++++ b/src/runtime/lock_sema.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build aix || darwin || netbsd || openbsd || plan9 || solaris || windows
+++//go:build aix || darwin || netbsd || openbsd || plan9 || solaris || windows || aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/mem_nonsbrk.go b/src/runtime/mem_nonsbrk.go
++index 41b7260e..5a4b34fd 100644
++--- a/src/runtime/mem_nonsbrk.go
+++++ b/src/runtime/mem_nonsbrk.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build !plan9 && !wasm
+++//go:build !plan9 && !wasm && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/mem_sbrk.go b/src/runtime/mem_sbrk.go
++index b8a2a752..ca7982fe 100644
++--- a/src/runtime/mem_sbrk.go
+++++ b/src/runtime/mem_sbrk.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build plan9 || wasm
+++//go:build plan9 || wasm || aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/mmap.go b/src/runtime/mmap.go
++index 9a7b2985..3b341385 100644
++--- a/src/runtime/mmap.go
+++++ b/src/runtime/mmap.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build !aix && !darwin && !js && !((linux && (amd64 || arm64 || loong64)) || (freebsd && amd64)) && !openbsd && !plan9 && !solaris && !windows
+++//go:build !aix && !darwin && !js && !((linux && (amd64 || arm64 || loong64)) || (freebsd && amd64)) && !openbsd && !plan9 && !solaris && !windows && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/netpoll_stub.go b/src/runtime/netpoll_stub.go
++index dc5d708b..ec1b114a 100644
++--- a/src/runtime/netpoll_stub.go
+++++ b/src/runtime/netpoll_stub.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build plan9
+++//go:build plan9 || aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/sigqueue.go b/src/runtime/sigqueue.go
++index 62a8e8a7..9a70c088 100644
++--- a/src/runtime/sigqueue.go
+++++ b/src/runtime/sigqueue.go
++@@ -28,7 +28,7 @@
++ // unnecessary rechecks of sig.mask, but it cannot lead to missed signals
++ // nor deadlocks.
++ 
++-//go:build !plan9
+++//go:build !plan9 && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/sigqueue_note.go b/src/runtime/sigqueue_note.go
++index fb1a517f..8465cfba 100644
++--- a/src/runtime/sigqueue_note.go
+++++ b/src/runtime/sigqueue_note.go
++@@ -7,7 +7,7 @@
++ // signal_recv thread. This file holds the non-Darwin implementations of
++ // those functions. These functions will never be called.
++ 
++-//go:build !darwin && !plan9
+++//go:build !darwin && !plan9 && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/stubs2.go b/src/runtime/stubs2.go
++index 39bde15b..eae4c83c 100644
++--- a/src/runtime/stubs2.go
+++++ b/src/runtime/stubs2.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build !aix && !darwin && !js && !openbsd && !plan9 && !solaris && !wasip1 && !windows
+++//go:build !aix && !darwin && !js && !openbsd && !plan9 && !solaris && !wasip1 && !windows && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/stubs3.go b/src/runtime/stubs3.go
++index c3749f34..d43c3bb7 100644
++--- a/src/runtime/stubs3.go
+++++ b/src/runtime/stubs3.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build !aix && !darwin && !freebsd && !openbsd && !plan9 && !solaris && !wasip1
+++//go:build !aix && !darwin && !freebsd && !openbsd && !plan9 && !solaris && !wasip1 && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/timestub.go b/src/runtime/timestub.go
++index eb91c022..5d9d6a31 100644
++--- a/src/runtime/timestub.go
+++++ b/src/runtime/timestub.go
++@@ -5,7 +5,7 @@
++ // Declarations for operating systems implementing time.now
++ // indirectly, in terms of walltime and nanotime assembly.
++ 
++-//go:build !faketime && !windows && !(linux && amd64) && !plan9
+++//go:build !faketime && !windows && !(linux && amd64) && !plan9 && !aros
++ 
++ package runtime
++ 
++diff --git a/src/runtime/timestub2.go b/src/runtime/timestub2.go
++index 336bac4b..65de79f5 100644
++--- a/src/runtime/timestub2.go
+++++ b/src/runtime/timestub2.go
++@@ -2,7 +2,7 @@
++ // Use of this source code is governed by a BSD-style
++ // license that can be found in the LICENSE file.
++ 
++-//go:build !aix && !darwin && !freebsd && !openbsd && !solaris && !wasip1 && !windows && !(linux && amd64) && !plan9
+++//go:build !aix && !darwin && !freebsd && !openbsd && !solaris && !wasip1 && !windows && !(linux && amd64) && !plan9 && !aros
++ 
++ package runtime
++ 
++-- 
++2.54.0 (Apple Git-157)
++
+diff --git a/src/cmd/go/internal/work/exec.go b/src/cmd/go/internal/work/exec.go
+index 8dcf3245..0e09bc61 100644
+--- a/src/cmd/go/internal/work/exec.go
++++ b/src/cmd/go/internal/work/exec.go
+@@ -2475,13 +2475,20 @@ func (b *Builder) compilerCmd(compiler []string, incdir, workdir string) []strin
+ 
+ 	// Definitely want -fPIC but on Windows gcc complains
+ 	// "-fPIC ignored for target (all code is position independent)"
+-	if cfg.Goos != "windows" {
++	if cfg.Goos != "windows" && cfg.Goos != "aros" {
+ 		a = append(a, "-fPIC")
+ 	}
+ 	a = append(a, b.gccArchArgs()...)
+-	// gcc-4.5 and beyond require explicit "-pthread" flag
+-	// for multithreading with pthread library.
+-	if cfg.BuildContext.CgoEnabled {
++	if cfg.Goos == "aros" {
++		// AROS executables are ET_REL and everything in the system is built
++		// this way; -fPIC is wrong here. The AROS gcc driver also does not
++		// accept -pthread -- libpthread.a is named explicitly instead, and has
++		// to be linked in a group with -lgcc because the emulated-TLS helper
++		// lives in libgcc.
++		a = append(a, "-mcmodel=large", "-mno-red-zone")
++	} else if cfg.BuildContext.CgoEnabled {
++		// gcc-4.5 and beyond require explicit "-pthread" flag
++		// for multithreading with pthread library.
+ 		a = append(a, "-pthread")
+ 	}
+ 
+diff --git a/src/cmd/link/internal/amd64/obj.go b/src/cmd/link/internal/amd64/obj.go
+index 3a6141b9..8ac10f7d 100644
+--- a/src/cmd/link/internal/amd64/obj.go
++++ b/src/cmd/link/internal/amd64/obj.go
+@@ -102,7 +102,8 @@ func archinit(ctxt *ld.Link) {
+ 			*ld.FlagTextAddr = ld.Rnd(0x1000000, *ld.FlagRound) + int64(ld.HEADR)
+ 		}
+ 
+-	case objabi.Hlinux, /* elf64 executable */
++	case objabi.Haros, /* AROS: ELF object, final link done externally */
++		objabi.Hlinux,     /* elf64 executable */
+ 		objabi.Hfreebsd,   /* freebsd */
+ 		objabi.Hnetbsd,    /* netbsd */
+ 		objabi.Hopenbsd,   /* openbsd */
+diff --git a/src/cmd/link/internal/ld/asmb.go b/src/cmd/link/internal/ld/asmb.go
+index 2088e13b..888d6fb6 100644
+--- a/src/cmd/link/internal/ld/asmb.go
++++ b/src/cmd/link/internal/ld/asmb.go
+@@ -106,7 +106,8 @@ func asmb2(ctxt *Link) {
+ 		asmbXcoff(ctxt)
+ 
+ 	// Elf
+-	case objabi.Hdragonfly,
++	case objabi.Haros,
++		objabi.Hdragonfly,
+ 		objabi.Hfreebsd,
+ 		objabi.Hlinux,
+ 		objabi.Hnetbsd,
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index a7d8e87b..290cf1b8 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -302,7 +302,7 @@ func (st *relocSymState) relocsym(s loader.Sym, P []byte) {
+ 				st.err.Errorf(s, "unknown reloc to %v: %d (%s)", ldr.SymName(rs), rt, sym.RelocName(target.Arch, rt))
+ 			}
+ 		case objabi.R_TLS_LE:
+-			if target.IsExternal() && target.IsElf() {
++			if target.IsExternal() && target.IsElf() && !target.IsAros() {
+ 				nExtReloc++
+ 				o = 0
+ 				if !target.IsAMD64() {
+diff --git a/src/internal/goos/zgoos_aros.go b/src/internal/goos/zgoos_aros.go
+new file mode 100644
+index 00000000..a693bc1c
+--- /dev/null
++++ b/src/internal/goos/zgoos_aros.go
+@@ -0,0 +1,27 @@
++// Code generated by gengoos.go using 'go generate'. DO NOT EDIT.
++
++//go:build aros
++
++package goos
++
++const GOOS = `aros`
++
++const IsAix = 0
++const IsAros = 1
++const IsAndroid = 0
++const IsDarwin = 0
++const IsDragonfly = 0
++const IsFreebsd = 0
++const IsHurd = 0
++const IsIllumos = 0
++const IsIos = 0
++const IsJs = 0
++const IsLinux = 0
++const IsNacl = 0
++const IsNetbsd = 0
++const IsOpenbsd = 0
++const IsPlan9 = 0
++const IsSolaris = 0
++const IsWasip1 = 0
++const IsWindows = 0
++const IsZos = 0
+diff --git a/src/runtime/os_aros.go b/src/runtime/os_aros.go
+new file mode 100644
+index 00000000..c0109b86
+--- /dev/null
++++ b/src/runtime/os_aros.go
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++// AROS OS layer.
++//
++// Every function here is a stub with the correct signature and a throw. That
++// is deliberate and temporary: the point of this file, in this state, is to
++// let package runtime compile so a program can be *linked*, which is the only
++// way to find out whether -linkmode=external can hand an ET_REL executable to
++// x86_64-aros-gcc. Until that question is answered there is no sense writing
++// the real implementations, because a negative answer changes the shape of the
++// port. Each stub is then replaced by exec.library/dos.library calls.
++//
++// Nothing here runs. Do not read a throw as a design decision.
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++const arosStub = "aros: not implemented"
++
++// mOS is the per-M operating-system state. An M on AROS will be an Exec task;
++// waitsemacount is what lock_sema.go requires of every platform that parks on
++// a counting semaphore rather than a futex.
++type mOS struct {
++	waitsemacount uint32
++}
++
++type sigset struct{}
++
++type gsignalStack struct{}
++
++// AROS has no Unix signal numbering. The value only has to bound the tables in
++// sigqueue_aros.go.
++const _NSIG = 32
++
++//
++// Startup and environment
++//
++
++func osinit()                 { throw(arosStub) }
++func goenvs()                 { throw(arosStub) }
++func libpreinit()             {}
++func getCPUCount() int32      { return 1 }
++func readRandom(r []byte) int { return 0 }
++
++//
++// Threads. An M will map onto an Exec task created with CreateNewProc.
++//
++
++func newosproc(mp *m)                                { throw(arosStub) }
++func newosproc0(stacksize uintptr, fn unsafe.Pointer) { throw(arosStub) }
++func mpreinit(mp *m)                                 { throw(arosStub) }
++func minit()                                         { throw(arosStub) }
++func unminit()                                       { throw(arosStub) }
++func mdestroy(mp *m)                                 {}
++func exitThread(wait *atomic.Uint32)                 { throw(arosStub) }
++func osyield()                                       { throw(arosStub) }
++
++//go:nosplit
++func osyield_no_g() { osyield() }
++
++//
++// Semaphores, used by lock_sema.go and the note implementation.
++//
++
++func semacreate(mp *m)         { throw(arosStub) }
++func semasleep(ns int64) int   { throw(arosStub); return 0 }
++func semawakeup(mp *m)         { throw(arosStub) }
++
++//
++// Process exit and raw output. These go to dos.library, not to a file
++// descriptor: AROS has no fd table at this level.
++//
++
++func exit(e int32) { throw(arosStub) }
++
++//go:nosplit
++func write1(fd uintptr, buf unsafe.Pointer, n int32) int32 { return -1 }
++
++func crash() { throw(arosStub) }
++
++//
++// Memory. mem_sbrk.go drives this; on AROS the primitive is AllocMem, which
++// has no brk-style contiguous growth, so this is the piece most likely to need
++// a different shape from Plan 9's.
++//
++
++func sbrk(n uintptr) unsafe.Pointer { return nil }
+diff --git a/src/runtime/signal_aros.go b/src/runtime/signal_aros.go
+new file mode 100644
+index 00000000..12eb0caa
+--- /dev/null
++++ b/src/runtime/signal_aros.go
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++// Signal handling for AROS. Stubs -- see the header of os_aros.go for why.
++//
++// AROS does not deliver Unix signals. Exec has its own signal bits per task,
++// and traps arrive through tc_TrapCode rather than through a handler table, so
++// this layer will end up closer to Plan 9's note mechanism than to signal_unix.go.
++// Preemption in particular has no obvious counterpart: preemptMSupported is
++// false for now, which costs only preemption latency, not correctness.
++
++package runtime
++
++func initsig(preinit bool)   {}
++func clearSignalHandlers()   {}
++func sigblock(exiting bool)  {}
++func sigsave(p *sigset)      {}
++func msigrestore(sigmask sigset) {}
++func sigenable(sig uint32)   {}
++func sigdisable(sig uint32)  {}
++func sigignore(sig uint32)   {}
++
++func signame(sig uint32) string { return "" }
++
++func setProcessCPUProfiler(hz int32) {}
++func setThreadCPUProfiler(hz int32)  {}
++
++const preemptMSupported = false
++
++func preemptM(mp *m) { throw("aros: preemptM not supported") }
+diff --git a/src/runtime/sigqueue_aros.go b/src/runtime/sigqueue_aros.go
+new file mode 100644
+index 00000000..00a00a9b
+--- /dev/null
++++ b/src/runtime/sigqueue_aros.go
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++// os/signal's interface to the runtime. AROS is excluded from sigqueue.go for
++// the same reason Plan 9 is: there is no Unix signal delivery to queue from.
++// Stubs -- see the header of os_aros.go.
++
++package runtime
++
++func signal_disable(s uint32) {}
++func signal_enable(s uint32)  {}
++func signal_ignore(s uint32)  {}
++func signal_ignored(s uint32) bool { return true }
++func signal_recv() string          { return "" }
+diff --git a/src/runtime/time_aros.go b/src/runtime/time_aros.go
+new file mode 100644
+index 00000000..fff34ade
+--- /dev/null
++++ b/src/runtime/time_aros.go
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build aros
++
++// Time for AROS. Stubs -- see the header of os_aros.go for why.
++//
++// The real source will be timer.device, or ReadEClock via the E-clock, whose
++// frequency AROS exposes as SysBase->ex_EClockFrequency. Note that a monotonic
++// clock has to come from the same place: there is nothing like CLOCK_MONOTONIC.
++
++package runtime
++
++import _ "unsafe" // for go:linkname
++
++func nanotime1() int64 { return 0 }
++
++func usleep(µs uint32) {}
++
++//go:nosplit
++func usleep_no_g(µs uint32) { usleep(µs) }
++
++// Do not remove or change the type signature.
++// See comment in timestub.go.
++//
++//go:linkname time_now time.now
++func time_now() (sec int64, nsec int32, mono int64) { return 0, 0, 0 }
+-- 
+2.54.0 (Apple Git-157)
+

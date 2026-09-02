@@ -13,8 +13,10 @@ established, and what has not.
 | Thread pointer on AROS | **done** — see [aros-tls](https://github.com/tomaszstaniak/aros-tls) |
 | `GOOS=aros` accepted by the toolchain | **done** |
 | `MOVQ TLS, r` lowering | **done, verified by disassembly** |
-| `package runtime` compiles | no — 37 undefined OS-layer symbols |
-| `syscall`, `os` | not started |
+| `package runtime` compiles | **yes**, with the OS layer stubbed |
+| A whole program compiles | **yes** — `runtime/cgo` too, via `x86_64-aros-gcc` |
+| Linking to an AROS executable | not yet — fails inside ELF relocation emission |
+| A working OS layer | no — every OS function is a `throw` stub |
 | Anything running on AROS | **no** |
 
 ## Why bother, and why the gc toolchain
@@ -93,9 +95,43 @@ that substitution is a space saving Plan 9 needs and AROS does not.
 Eight build tags cut the undefined OS-layer symbols from **57 to 37**. Nothing
 runs; this only means the compiler now fails in the right places.
 
+## Patch 3: stubs, to reach the linker early
+
+The 37 OS-layer symbols are implemented as stubs with correct signatures that
+`throw`. That ordering is deliberate. The unverified assumption underneath this
+whole port is that `-linkmode=external` can hand an ET_REL executable to
+`x86_64-aros-gcc`; if it cannot, Go's linker has to learn AROS's executable
+format, which is a much larger job. Stubbing costs a few hundred lines and
+answers that question before the real OS layer is written.
+
+Three things were needed to get that far, and each is a real finding rather
+than boilerplate:
+
+* **`Haros` is treated as ELF** in `archinit` and `asmb2`, so the linker writes
+  a relocatable object for the host linker — but `R_TLS_LE` is deliberately
+  *still resolved internally*. `g` is reached through a pointer the kernel
+  publishes in the `%gs` block, not through ELF TLS, so handing that relocation
+  to `x86_64-aros-gcc` would ask it for something it cannot do.
+* **`-fPIC` and `-pthread` are dropped for `GOOS=aros`** in `cmd/go`, replaced
+  by `-mcmodel=large -mno-red-zone`. AROS builds everything `ET_REL`, and its
+  gcc driver rejects `-pthread` outright.
+* **The note functions came straight back out** of the stub file: `lock_sema.go`
+  already supplies them once `aros` is on its build tag.
+
+Where it stops today:
+
+```
+panic: elfrelocsect: size mismatch 2253840 != 2120664 + 127440
+```
+
+So the external-linking question is **not yet answered** — but the failure has
+moved from "unsupported platform" to a specific arithmetic mismatch inside
+relocation emission, which is a bug to find rather than a wall. Nothing so far
+suggests the approach is unworkable.
+
 ## What remains
 
-The runtime, and it is the bulk of the work. Measured against Plan 9's port as
+The real OS layer, and it is the bulk of the work. Measured against Plan 9's port as
 the closest template:
 
 | package | lines |
